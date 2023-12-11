@@ -1,0 +1,322 @@
+---
+title: "analisis_rnaseq"
+author: "Pablo Aguirre Azorín"
+date: "2023-11-13"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(edgeR)
+```
+
+---
+
+\newpage
+
+# Introducción
+
+Existen numerosos métodos a la hora de abordar un análisis de genes diferencialmente expresados a partir de datos RNA-seq. Ello se debe por un lado a que el mejor método varía en cada caso, ya que la principal diferencia radica en el modelo probabilístico empleado, y éste depende de las características propias del experimento. Por otro lado, la realidad es que no hay un consenso respecto a la modalidad estadística que hay que emplear.
+
+Prueba de ello es la gran cantidad de paquetes de Bioconductor desarrollados:
+En primer lugar nos encontramos los enfoques paramétricos, entre los que encontramos DESeq2 y edgeR (basados en la distribución binomial negativa), limma-voom (basado en modelo lineal), baySeq (bayesiano basado en binomial negativa) o DESeq (distribución de poisson), entre otros. También existen métodos que tienen un enfoque no paramétrico, como NOISeq, dearseq y Wilcoxon rank-sum test.
+
+Los paquetes más utilizados para realizar el análisis de expresión diferencial, son limma, edgeR y DESeq2. Los tres métodos tienen sus propias ventajas, y la elección solo depende del tipo de datos (Liu et al., 2021).
+
+Sin embargo, Li et al. (2022) han observado que, cuando el tamaño muestral es superior a 8 muestras por grupo, el método no paramétrico Wilcoxon rank-sum test funciona mucho mejor que cualquier otro. No solo eso, sino que cuando el tamaño muestral es del orden de docenas ninguno de los tres métodos paramétricos (edgeR, Limma o DESeq2) se comporta correctamente, al infringirse los supuestos paramétricos (fallando el control de FDR). En ese caso, se recomienda usar el Wilcoxon rank-sum test.
+
+Esto mismo señalan Zhang et al (2019):
+
+"En general, el test de Wilcoxon sin transformación de datos se puede usar para detectar diferencias en los transcritos génicos expresados de manera diferente en datos de RNA-seq cuando el tamaño de la muestra es grande y los tamaños de las bibliotecas de muestras son desiguales. Si se prefiere la transformación de datos, entonces se puede usar limma con voom, l, r2 o lv2 en este escenario. El test de Wilcoxon sin transformación de datos tuvo un rendimiento mejor que el análisis de limma basado en 9 transformaciones de datos en estudios de simulación cuando los tamaños de las muestras no son demasiado pequeños y los tamaños de las bibliotecas de muestras son desiguales".
+
+Por tanto, el análisis de expresión diferencial se realiza en este caso mediante el protocolo de Wilcoxon rank-sum test propuesto en Li et al (2022). 
+
+# Carga de los datos
+
+```{r}
+# Carga de los datos para análisis rnaseq
+datos_rnaseq <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\contajes_rnaseq.csv", check.names = FALSE)
+metadatos_rnaseq <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\metadatos_rnaseq.csv", check.names = FALSE)
+```
+
+Como se observa en la salida inferior, se parte de una tabla de contajes brutos, en la que cada fila representa un gen y cada columna, una muestra. Respecto a los IDs de las muestras, en la fase de exploración fueron editados para que contuvieran el grupo al que pertenecen (AD, MCI o NCI) y así facilitar el análisis.
+
+```{r}
+# Mostrar cabecera de la tabla de contajes
+head(datos_rnaseq[, 1:5])
+```
+
+# Creación del objeto DGEList
+
+Primeramente extraigo los grupos de las muestras y después 
+
+```{r}
+# Extracción de los grupos de las muestras
+id_muestras <- colnames(datos_rnaseq)[-1]
+grupos_muestras <- sapply(strsplit(id_muestras, "_"), function(x) tail(x, 1))
+```
+
+Genero el objeto DGEList.
+
+```{r}
+# Objeto DGEList
+dge <- DGEList(counts = datos_rnaseq, 
+                group = grupos_muestras)
+```
+
+# Normalización
+
+Está debatido el uso de la normalización y la transformación a CPM. Zhang et al (2019) sugiere aplicar el wilcoxon test directamente sobre los contajes. Pero en el protocolo que estoy siguiendo (Li et al 2022) se realiza la normalización y la transformación a CPM. Similar procedimiento respecto a la transformación en CPM se sugiere en el soporte técnico de bioconductor. Por tanto, me decanto por realizar una normalización TMM y conversión a CPMs.
+
+```{r}
+# Normalización TMM
+dge_normalizado <- calcNormFactors(dge)
+
+# Conversión en CPM
+dge_normalizado <- as.data.frame(cpm(dge_normalizado))
+```
+
+# Análisis de expresión diferencial
+
+Para el análisis de expresión diferencial se realiza el Wilcoxon rank-sum test para cada gen.
+
+```{r}
+# Inicializo una matriz para almacenar los pvalues
+# Tendrá tantas columnas como combinaciones entre grupos (cada columna tendrá
+# el pvalor de la comparaciónn entre dos grupos) y tantas filas como genes
+grupos_unicos <- unique(grupos_muestras)
+pvalues <- data.frame(matrix(NA, nrow = nrow(dge_normalizado), 
+                  ncol = choose(length(grupos_unicos), 2)))
+
+# Realizar las pruebas de Wilcoxon por pares
+contador = 0 # Con esta variable selecciono la columna de pvalues que modifico
+for (i in 1:(length(grupos_unicos)-1)) {
+  for (j in (i+1):length(grupos_unicos)) {
+    grupo1 <- grupos_unicos[i]
+    grupo2 <- grupos_unicos[j]
+    contador <- contador + 1
+    
+    # Subconjunto de datos para los dos grupos
+    data_subset <- dge_normalizado[, grupos_muestras %in% c(grupo1, grupo2)]
+    id_subset <- colnames(dge_normalizado[, grupos_muestras %in% 
+                                            c(grupo1, grupo2)])
+    grupos_subset <- sapply(strsplit(id_subset, "_"), function(x) tail(x, 1))
+    
+    # Calculo el p valor de esa combinacion de grupos
+    pvalues[, contador] <- sapply(1:nrow(data_subset),function(z){
+      data<-cbind.data.frame(gene=as.numeric(t(data_subset[z, ])),
+                             grupos_subset)
+      p=wilcox.test(gene~grupos_subset, data)$p.value
+      return(p)
+      })
+    
+    # Para identificar la combinación, cambio el nombre de la columna
+    colnames(pvalues)[contador] <- paste(unique(grupos_subset), 
+                                           collapse = "_")
+  }
+}
+```
+
+Ajuste los p valores para controlar el FDR.
+
+```{r}
+# Ajuste de los p valores
+fdr <- as.data.frame(sapply(as.data.frame(pvalues), p.adjust, method = "fdr"))
+```
+
+Extraigo los datos de los distintos grupos.
+
+```{r}
+# Datos de los distintos grupos
+data_grupo_ad <- dge_normalizado[,c(which(grupos_muestras == "AD"))]
+data_grupo_mci <- dge_normalizado[,c(which(grupos_muestras == "MCI"))]
+data_grupo_nci <- dge_normalizado[,c(which(grupos_muestras == "NCI"))]
+```
+
+## Diferencias de expresión entre los grupos AD y NCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_ad_nci=log2(rowMeans(data_grupo_ad)/rowMeans(data_grupo_nci))
+
+# Salida final basada en el FDR
+salida_ad_nci <- data.frame(log2foldChange=foldChanges_ad_nci, 
+                        pValues=pvalues$AD_NCI, 
+                        FDR=fdr$AD_NCI)
+# Asigno los id de los genes a las filas
+rownames(salida_ad_nci) <- datos_rnaseq$gene_id[as.numeric(rownames(salida_ad_nci))]
+salida_ad_nci <- na.omit(salida_ad_nci) # elimino filas con na
+
+# Guardo la salida
+write.table(salida_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_ad_nci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05 y logfoldchange >=0.5
+genes_DE_ad_nci <- salida_ad_nci[salida_ad_nci$FDR<umbral
+                   & abs(salida_ad_nci$log2foldChange) >= 0.5,] 
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_ad_nci.csv")
+```
+
+```{r}
+salida_ad_nci <- salida_ad_nci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_ad_nci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "royalblue", "UP" = "coral1")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. NCI")  +
+  scale_x_continuous(limits = c(-5, +5)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_ad_nci.png", plot = last_plot())
+```
+
+## Diferencias de expresión entre los grupos AD y MCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_ad_mci=log2(rowMeans(data_grupo_ad)/rowMeans(data_grupo_mci))
+
+# Salida final basada en el FDR
+salida_ad_mci <- data.frame(log2foldChange=foldChanges_ad_mci, 
+                        pValues=pvalues$AD_MCI, 
+                        FDR=fdr$AD_MCI)
+# Asigno los id de los genes a las filas
+rownames(salida_ad_mci) <- datos_rnaseq$gene_id[as.numeric(rownames(salida_ad_mci))]
+salida_ad_mci <- na.omit(salida_ad_mci) # elimino filas con na
+
+# Guardo la salida
+write.table(salida_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_ad_mci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05 y logfoldchange >=0.5
+genes_DE_ad_mci <- salida_ad_mci[salida_ad_mci$FDR<umbral 
+                   & abs(salida_ad_mci$log2foldChange) >= 0.5,] 
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_ad_mci.csv")
+```
+
+```{r}
+salida_ad_mci <- salida_ad_mci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_ad_mci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "royalblue", "UP" = "coral1")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. MCI")  +
+  scale_x_continuous(limits = c(-5, +5)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_ad_mci.png", plot = last_plot())
+```
+
+## Diferencias de expresión entre los grupos MCI y NCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_mci_nci=log2(rowMeans(data_grupo_mci)/rowMeans(data_grupo_nci))
+
+# Salida final basada en el FDR
+salida_mci_nci <- data.frame(log2foldChange=foldChanges_mci_nci, 
+                        pValues=pvalues$MCI_NCI, 
+                        FDR=fdr$MCI_NCI)
+# Asigno los id de los genes a las filas
+rownames(salida_mci_nci) <- datos_rnaseq$gene_id[as.numeric(rownames(salida_mci_nci))]
+salida_mci_nci <- na.omit(salida_mci_nci) # elimino filas con na
+
+# Guardo la salida
+write.table(salida_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_mci_nci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05 y logfoldchange >=0.5
+genes_DE_mci_nci <- salida_mci_nci[salida_mci_nci$FDR<umbral
+                    & abs(salida_mci_nci$log2foldChange) >= 0.5,] 
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_mci_nci.csv")
+```
+
+```{r}
+salida_mci_nci <- salida_mci_nci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_mci_nci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "royalblue", "UP" = "coral1")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "MCI vs. NCI")  +
+  scale_x_continuous(limits = c(-5, +5)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_mci_nci.png", plot = last_plot())
+```
+
+# Bibliografía
+
++ Li, Y., Ge, X., Peng, F. et al. Exaggerated false positives by popular differential expression methods when analyzing human population samples. Genome Biol 23, 79 (2022). https://doi.org/10.1186/s13059-022-02648-4.
++ Liu, S., Wang, Z., Zhu, R., Wang, F., Cheng, Y., Liu, Y. Three Differential Expression Analysis Methods for RNA Sequencing: limma, EdgeR, DESeq2. J. Vis. Exp. (175), e62528, doi:10.3791/62528 (2021).
++ Zhang Z, Yu D, Seo M, Hersh CP, Weiss ST, Qiu W. Novel Data Transformations for RNA-seq Differential Expression Analysis. Sci Rep. 2019 Mar 18;9(1):4820. doi: 10.1038/s41598-019-41315-w. PMID: 30886278; PMCID: PMC6423143.
++ edgeR or wilcoxon rank test? Which is right?. https://support.bioconductor.org/p/117512/
+
+
+
+
