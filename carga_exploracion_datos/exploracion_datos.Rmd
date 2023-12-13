@@ -24,6 +24,8 @@ library(dplyr)
 library(tidyr)
 library(ggplot2)
 library(R.utils) # Para usar gunzip
+library(ggVennDiagram)
+library(VennDiagram)
 ```
 
 ---
@@ -163,7 +165,7 @@ Procedo a preparar la carga de contajes para su análisis.
 # Elimino aquellas filas que no correspondan a genes (filtrando por aquellas
 # filas que empiecen por el prefijo ENSG)
 
-contajes_rnaseq_raw_genes <- contajes_rnaseq_raw %>% 
+contajes_rnaseq_raw <- contajes_rnaseq_raw %>% 
   filter(grepl("^ENSG.*", feature)) %>% 
   rename(gene_id = feature)
 
@@ -173,7 +175,7 @@ Para generar la tabla de pacientes de RNA Seq primero voy a crear un vector con 
 
 ```{r}
 # Vector con los id de las muestras de RNA Seq
-muestras_rnaseq <- colnames(contajes_rnaseq_raw_genes)
+muestras_rnaseq <- colnames(contajes_rnaseq_raw)
 
 # Crear la tabla de los pacientes de RNA seq
 pacientes_rnaseq_sinfiltrar <- pacientes %>% 
@@ -258,17 +260,17 @@ for (i in muestras_rnaseq) {
 }
 
 # Renombro las muestras con los ID generados
-colnames(contajes_rnaseq_raw_genes) <- muestras_rnaseq_id
+colnames(contajes_rnaseq_raw) <- muestras_rnaseq_id
 
 # Elimino las muestras cuyo diagnóstico es "Other" y de las que no consta su paciente asociado.
-contajes_rnaseq_raw_genes_filtrado <- contajes_rnaseq_raw_genes %>% 
+contajes_rnaseq_raw_filtrado <- contajes_rnaseq_raw %>% 
   select(ends_with(c("gene_id", "AD", "MCI", "NCI")))
 ```
 
 Por último, guardo los data frames generados (tanto los metadatos como los datos) en archivos para ser analizados. 
 
 ```{r}
-write.table(contajes_rnaseq_raw_genes_filtrado,
+write.table(contajes_rnaseq_raw_filtrado,
   "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\contajes_rnaseq.csv")
 ```
 
@@ -407,10 +409,12 @@ pacientes_proteinas_sinfiltrar <- pacientes %>%
   filter(individualID %in% muestras$individualID[muestras$specimenID
                                   %in% specimenID_proteinas]) %>% 
     rowwise() %>%  # Para que la siguiente operación se produzca fila por fila
-  mutate(proteomicID = metadatos_proteomicos$SampleID[metadatos_proteomicos$SpecimenID %in% 
-                       muestras$specimenID[muestras$individualID == individualID]],
-         batch = metadatos_proteomicos$Batch[metadatos_proteomicos$SpecimenID %in% 
-                       muestras$specimenID[muestras$individualID == individualID]])
+  mutate(proteomicID = 
+           metadatos_proteomicos$SampleID[metadatos_proteomicos$SpecimenID %in% 
+                       muestras$specimenID[muestras$individualID == 
+                                             individualID]],
+         batch = metadatos_proteomicos$Batch[metadatos_proteomicos$SpecimenID 
+                %in% muestras$specimenID[muestras$individualID == individualID]])
 ```
 
 Voy a representar ahora la distribución en grupos de los pacientes proteómicos.
@@ -493,4 +497,122 @@ write.table(datos_proteomicos, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\prote
 write.table(pacientes_proteinas, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\pacientes_proteomicos.csv")
 ```
 
+# Preparación de los datos para la integración multiómica
+
+Como puede observarse en el diagrama de Venn generado, solo 127 (14%) de todos los pacientes presenta muestras de las tres ómicas de estudio.
+
+```{r}
+library(ggplot2)
+
+ggVennDiagram(list(rnaseq = pacientes_rnaseq$individualID, 
+                   metilacion = pacientes_metilacion$individualID,
+                   proteomica = pacientes_proteinas$individualID)) +
+  scale_fill_gradient(low = "#F4FAFE", high = "#4981BF") +
+  theme(legend.position = "none")
+
+#ggsave("diagrama_venn.png", plot = last_plot())
+```
+
+
+```{r}
+# Diagrama de Venn
+venn <- venn.diagram(list(rnaseq = pacientes_rnaseq$individualID, 
+                   metilacion = pacientes_metilacion$individualID,
+                   proteomica = pacientes_proteinas$individualID),
+             filename = "diagrama_venn.png",
+             fill = rainbow(3),
+             disable.logging = TRUE,
+             output = TRUE)
+```
+
+Paso a extraer los pacientes que poseen muestras en al menos dos ómicas.
+
+```{r}
+
+# Pacientes que poseen muestras en al menos dos ómicas
+interseccion_rnaseq_metilacion <- intersect(pacientes_rnaseq$individualID,                                          pacientes_metilacion$individualID)
+interseccion_rnaseq_proteomica <- intersect(pacientes_rnaseq$individualID,                                          pacientes_proteinas$individualID)
+interseccion_metilacion_proteomica <- intersect(pacientes_metilacion$individualID,                                          pacientes_proteinas$individualID)
+# Vector con los id de los pacientes multiomicos
+interseccion <- unique(c(
+  interseccion_rnaseq_proteomica,
+  interseccion_rnaseq_metilacion,
+  interseccion_metilacion_proteomica
+))
+
+# Data frame con los pacientes multiómicos
+pacientes_multiomicos <- pacientes %>% 
+  filter(individualID %in% interseccion) 
+
+# Genero un data frame para cada tipo ómico con los matches
+rnaseq_matches <- pacientes_rnaseq %>%
+  filter(individualID %in% pacientes_multiomicos$individualID) %>%
+  select(individualID, rnaseqID)
+
+metilacion_matches <- pacientes_metilacion %>% 
+  filter(individualID %in% pacientes_multiomicos$individualID) %>% 
+  select(individualID, metilacionID)
+
+proteomica_matches <- pacientes_proteinas %>% 
+  filter(individualID %in% pacientes_multiomicos$individualID) %>% 
+  select(individualID, proteomicID)
+
+# Añado los id de las muestras de cada tipo ómico
+pacientes_multiomicos <- pacientes_multiomicos %>%
+  left_join(rnaseq_matches, by = "individualID") %>%
+  left_join(metilacion_matches, by = "individualID") %>%
+  left_join(proteomica_matches, by = "individualID") 
+```
+
+En la documentación del paquete `MOFA2` de `Bioconductor` se afirma que es fundamental utilizar los datos propiamente normalizados.
+
+Por ello, para la integración multiómica se va a utilizar:
+
++ RNA-Seq: La tabla de contajes normalizados mediante TMM y convertidos en CPM (generada en el protocolo de análisis RNA-Seq).
++ Metilación: La tabla de Valores M, ya que se recomienda usar dichos valores para realizar análisis estadísticos. Esta tabla también se ha generado en el protocolo de análisis metilación.
++ Proteómica: La tabla descargada ya ha sido normalizada y preprocesada y contiene el log2 de la abundancia de los péptidos a lo largo de las muestras, centrado alrededor de la mediana cercana a 0.
+
+Procedo por tanto a preparar la tabla de pacientes proteómicos. La documentación de `MOFA2` recomienda
+
+Voy a modificar los id de las muestras por id de pacientes. Aquellos pacientes que no posean muestra proteómica, sera una columna de NA
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+pacientes_proteinas_sinfiltrar %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico",
+       title = "Pacientes de las muestras proteómicas sin filtrar") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5,
+                                  margin = margin(t = 0, r = 0, b = 20, l = 0)))
+
+
+
+
+```
 

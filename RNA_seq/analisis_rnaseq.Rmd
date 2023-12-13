@@ -91,6 +91,15 @@ dge_normalizado <- calcNormFactors(dge)
 dge_normalizado <- as.data.frame(cpm(dge_normalizado))
 ```
 
+## Exportación de la tabla normalizada
+
+Exporto la tabla de contajes normalizados mediante TMM y convertidos en CPM para realizar la integración multiómica.
+
+```{r}
+write.table(dge_normalizado, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\rnaseq_normalizado.csv")
+```
+
+
 # Análisis de expresión diferencial
 
 Para el análisis de expresión diferencial se realiza el Wilcoxon rank-sum test para cada gen.
