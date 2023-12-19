@@ -19,6 +19,7 @@ pacientes_multiomicos.csv
 metilacion_HVG.csv
 proteomica_HVG.csv
 RNAseq_HVG.csv
+datos_multiomicos.csv
 
 # Archivos que no tienen nada que ver con este análisis
 protocolos_analisis_metilacion.R

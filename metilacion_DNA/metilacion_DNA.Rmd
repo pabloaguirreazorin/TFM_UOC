@@ -29,6 +29,7 @@ library(RColorBrewer) # paletas de colores predefinidas para la visualización d
 library(qqman) #Manhattan plot y qqplot
 library(missMethyl) # ORA
 library(ggplot2)
+library(matrixStats) # Función rowVars
 ```
 
 ---

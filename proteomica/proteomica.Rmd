@@ -28,6 +28,7 @@ library(org.Hs.eg.db)
 library(clusterProfiler)
 library(AnnotationDbi)
 library(DOSE)
+library(matrixStats) # Función rowVars
 ```
 
 ---
@@ -611,7 +612,7 @@ topvarProteinas <- unique(c(topvarProteinas_ad, topvarProteinas_mci, topvarProte
 
 ```{r}
 # Generación de la tabla con los HVGs
-proteomic_topvarProteinas <- dge_normalizado[topvarProteinas,]
+proteomic_topvarProteinas <- datos_proteomicos[topvarProteinas,]
 ```
 
 ## Exportación de la tabla normalizada
