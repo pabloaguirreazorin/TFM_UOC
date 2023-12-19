@@ -14,9 +14,11 @@ datos_metilacion.csv
 pacientes_metilacion.csv
 datos_proteomicos.csv
 pacientes_proteomicos.csv
-mvals_metilacion.csv
 rnaseq_normalizado.csv
 pacientes_multiomicos.csv
+metilacion_HVG.csv
+proteomica_HVG.csv
+RNAseq_HVG.csv
 
 # Archivos que no tienen nada que ver con este análisis
 protocolos_analisis_metilacion.R

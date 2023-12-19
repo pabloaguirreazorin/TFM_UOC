@@ -1,1 +1,1 @@
-"logFC" "AveExpr" "t" "P.Value" "adj.P.Val" "B"
+"chr" "pos" "strand" "Name" "Islands_Name" "Relation_to_Island" "UCSC_RefGene_Name" "UCSC_RefGene_Accession" "UCSC_RefGene_Group" "Regulatory_Feature_Name" "Regulatory_Feature_Group" "logFC" "AveExpr" "t" "P.Value" "adj.P.Val" "B"

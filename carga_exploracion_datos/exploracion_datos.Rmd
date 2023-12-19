@@ -576,6 +576,9 @@ Procedo por tanto a preparar la tabla de pacientes proteómicos. La documentaci�
 
 Voy a modificar los id de las muestras por id de pacientes. Aquellos pacientes que no posean muestra proteómica, sera una columna de NA
 
+```{r}
+write.table(pacientes_multiomicos, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\pacientes_multiomicos.csv")
+```
 
 
 
