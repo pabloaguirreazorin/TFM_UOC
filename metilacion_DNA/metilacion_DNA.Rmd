@@ -28,7 +28,6 @@ library(RPMM) # Se requiere para aplicar la función BMIQ
 library(RColorBrewer) # paletas de colores predefinidas para la visualización de datos
 library(qqman) #Manhattan plot y qqplot
 library(missMethyl) # ORA
-library(ggplot2)
 library(matrixStats) # Función rowVars
 ```
 
@@ -65,6 +64,13 @@ unique(metadatos_metilacion$Island_Feature)
 
 Una vez que se han cargado los datos, he realizado el análisis de metilación, inspirándome en el protocolo de Maksimovic et al., (2017) que utiliza los paquetes de Bioconductor `minfi` y `limma`. Sin embargo, en dicho portocolo se parte de los ficheros IDAT. En mi caso parto de una tabla que recopila los valores beta de cada sonda en las distintas muestras, por lo que el procedimiento que he seguido es algo diferente.
 
+Antes de comenzar, voy a sumar un pequeño valor si el valor beta es 0 y restárselo si el valor beta es 1. Esta manera de hacerlo no es lo habitual, pero lo hago porque al calcular los valores M mediante la función `getM` de `minfi`, no me permite añadir un `betaThreshold`.
+
+```{r}
+datos_metilacion[datos_metilacion == 0] <- 0.00001
+datos_metilacion[datos_metilacion == 1] <- 0.99999
+```
+
 # Generación del objeto `GenomicRatioSet`
 
 Este objeto (del paquete `minfi`) almacena los valores beta y es necesario para poder aplicar las funciones de `minfi`.
@@ -79,7 +85,8 @@ rownames(datos_metilacion_matriz) <- probes
 
 ```{r}
 # Genero el objeto GenomicRatioSet
-metilacion_grs <- makeGenomicRatioSetFromMatrix(datos_metilacion_matriz, rownames = probes)
+metilacion_grs <- makeGenomicRatioSetFromMatrix(datos_metilacion_matriz, 
+                                                rownames = probes)
 
 # Elimino para no saturar memoria
 rm(datos_metilacion_matriz)
@@ -101,8 +108,9 @@ En el protocolo he seguido, se recomienda usar los valores beta para las represe
 
 ```{r}
 # Obtención de los m y beta values
-mVals <- getM(metilacion_grs_filtrado) # Para el análisis de metilación diferencial en limma
 bVals <- getBeta(metilacion_grs_filtrado)
+mVals <- getM(metilacion_grs_filtrado) 
+
 
 # Extraigo un vector con los grupos de las distintas muestras 
 id_muestras_metilacion <- colnames(metilacion_grs_filtrado)
@@ -221,7 +229,7 @@ ggplot(top_metilacion_ad_nci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM)
   labs(x = "log2(fold change)",
        y = "-log10(adj.p-value)",
        title = "AD vs. NCI")  +
-  scale_x_continuous(limits = c(-1, +1)) +
+  scale_x_continuous(limits = c(-2.5, +2.5)) +
   scale_y_continuous(limits = c(0, 12)) +
   theme(plot.title = element_text(hjust = 0.5), 
         legend.position = "right", 
@@ -340,7 +348,7 @@ ggplot(top_metilacion_ad_mci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM)
   labs(x = "log2(fold change)",
        y = "-log10(adj.p-value)",
        title = "AD vs. MCI")  +
-  scale_x_continuous(limits = c(-1, +1)) +
+  scale_x_continuous(limits = c(-2.5, +2.5)) +
   scale_y_continuous(limits = c(0, 12)) +
   theme(plot.title = element_text(hjust = 0.5), 
         legend.position = "right", 
@@ -457,7 +465,7 @@ ggplot(top_metilacion_mci_nci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM
   labs(x = "log2(fold change)",
        y = "-log10(adj.p-value)",
        title = "MCI vs. NCI")  +
-  scale_x_continuous(limits = c(-1, +1)) +
+  scale_x_continuous(limits = c(-2.5, +2.5)) +
   scale_y_continuous(limits = c(0, 12)) +
   theme(plot.title = element_text(hjust = 0.5), 
         legend.position = "right", 
@@ -503,6 +511,7 @@ SigCpG_mci_nci <- rownames(top_metilacion_mci_nci[
 
 length(SigCpG_mci_nci)
 ```
+
 Como no se han detectado CpGs significativos, no se puede realizar el ORA.
 
 # Preparación de los datos para la integración multiómica
