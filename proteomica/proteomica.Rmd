@@ -1,0 +1,524 @@
+---
+title: "Análisis proteómico"
+author: "Pablo Aguirre Azorín"
+date: "2023-12-05"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+library(limma)
+# Para el GSEA
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot) # Gráficas del GSEA
+library(AnnotationDbi)
+library(DOSE)
+library(matrixStats) # Función rowVars
+```
+
+---
+
+\newpage
+
+# Introducción
+
+Como se explica en el AD Knowledge Portal, para el estudio proteómico se realizó un análisis cuantitativo por TMT 10-plex de 400 individuos. Para ello se agruparon en 50 lotes de 8 muestras 2 estándares de referencia GIS por lote y se analizaron mediante LC-MS. El resultado es 1200 archivos brutos (ya que se hicieron 3 réplicas técnicas para aumentar la robustez de los datos).
+
+Los archivos brutos generados de este proceso fueron analizados y se generó un archivo final en el que se muestra el log2 de la abundancia de los péptidos a lo largo de las muestras. Dicho archivo ha sido sometido a un preprocesado en el que se realizó una corrección por lotes (batch correction). Luego, se aplicó un ajuste adicional que tiene en cuenta la edad, el sexo y el intervalo post-mortem para eliminar su influencia en las abundancias de proteínas. Además, se centraron alrededor de la mediana cercana a cero, se eliminaron valores atípicos y se excluyeron casos ambiguos para mejorar la precisión de los datos proteómicos.
+
+# Carga de los datos
+
+```{r}
+datos_proteomicos <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\datos_proteomicos.csv", check.names = FALSE)
+pacientes_proteomicos <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\pacientes_proteomicos.csv", check.names = FALSE)
+```
+
+Una vez que he cargado los datos, voy a hacer un análisis de la abundancia diferencial de proteínas. Para ello se pueden utilizar diferentes métodos, como se describe en (Huang et al., 2020). Por un lado, se podría utilizar edgeR, pero tiene la limitación de que solo contempla diseños experimentales con un batch y una réplica técnica. Por otro lado, Limma y MSstatsTMT sí contemplan diseños experimentales con varios batches y varias réplicas técnicas.
+
+Como se explica en (Huang et al., 2020) se realiza el mismo método de normalización de los niveles de proteína que el que se empleó con este conjunto de datos (centrando la mediana en cero). En un par de artículos (Chen et al., 2020; Kammers et al., 2015) se afirma que el método Limma es muy efectivo para conjuntos de datos proteómicos que poseen bajo número de muestras por lote y múltiples experimentos (batches).
+
+También se ha contemplado el uso del paquete MSstatsTMT, ya que Huang et al. (2020) explica que los diseños de split-split-plot (como sucede en este caso) se representa óptimamente mediante un modelo lineal de efectos mixtos con múltiples componentes de varianza, aunque la estimación de estos modelos no es escalable para conjuntos de datos a gran escala con muchas proteínas y ejecuciones, y es difícil de extender a casos con valores faltantes y valores atípicos. Por ello, el paquete MSstatsTMT generaliza este modelo lineal de efecto mixtos con múltiples componentes de varianza a diseños más complejos, muchas proteínas. Además, en el mismo artículo se compara ese paquete con Limma y edgeR, entre otros, y es el que se muestra mejor balanceado respecto al número de TPs y eFDR.
+
+Sin embargo, se ha descartado su uso, ya que parece ser que para utilizarlo habría que partir de los 1200 archivos RAW. No valdría el data frame descargado (confirmar).
+
+```{r}
+# Extraigo los id de las proteinas en formato UNIPROT
+id_proteinas <- datos_proteomicos$protein_id
+id_proteinas <- sapply(strsplit(id_proteinas, "\\|"),
+                                       function(x) tail(x, 1))
+
+datos_proteomicos <- datos_proteomicos[, -1]
+rownames(datos_proteomicos) <- id_proteinas
+```
+
+
+```{r}
+# Extraigo un vector con los grupos de las distintas muestras 
+id_muestras_proteomicas <- colnames(datos_proteomicos)
+grupos_proteomicos <- sapply(strsplit(id_muestras_proteomicas, "_"), 
+                             function(x) tail(x, 1))
+```
+
+
+```{r}
+# MDS Plot teniendo en cuenta los grupos (de limma)
+plotMDS(datos_proteomicos, top=1000, gene.selection="common", pch = 1,
+        col=brewer.pal(8, "Dark2")[factor(grupos_proteomicos)])
+legend("topleft", legend = levels(factor(grupos_proteomicos)), 
+       text.col = brewer.pal(8, "Dark2"), bg="white", cex=0.7)
+```
+
+```{r}
+# MDS Plot teniendo en cuenta los batches (de limma)
+plotMDS(datos_proteomicos, top=1000, gene.selection="common", pch = 1,
+        col=rainbow(n = factor(batches)))
+```
+
+Los resultados del último MDS plot revelan que no hay efecto batch.
+
+# Análisis de abundancia diferencial de proteínas
+
+Antes de ello defino la matriz de diseño y la de contrastes.
+
+```{r}
+# Matriz de diseño
+design_prot <- model.matrix(~ 0 + grupos_proteomicos)
+rownames(design_prot) <- id_muestras_proteomicas
+colnames(design_prot) <- sort(unique(grupos_proteomicos))
+
+
+
+# Matriz de contrastes para las comparaciones 
+contMatrix_prot <- makeContrasts(AD - NCI,
+                                 AD - MCI,
+                                 MCI - NCI,
+                                 levels = design_prot)
+```
+
+Procedo a realizar el análisis de abundancia diferencial de proteínas usando `limma`
+
+```{r}
+# Ajustar el modelo lineal
+fit_prot <- lmFit(datos_proteomicos, design_prot)
+
+# Estimación de los contrastes
+fit_contrast_prot <- contrasts.fit(fit_prot, contMatrix_prot)
+fit_ebayes_prot <- eBayes(fit_contrast_prot)
+
+# Test de significacion para cada proteína
+dt_fit_prot <- decideTests(object = fit_ebayes_prot)
+
+# Guardo el resumen de las diferencias en proteómica
+write.table(summary(dt_fit_prot), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\resumen_prot_DA.csv")
+
+summary(dt_fit_prot)
+```
+
+## Diferencias de expresión entre los grupos AD y NCI
+
+```{r}
+# Visualizar los resultados (topTable)
+top_proteomica_ad_nci <- as.data.frame(topTable(fit_ebayes_prot, coef = 1, number = Inf))
+
+# Guardo la salida
+write.table(top_proteomica_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\toptable_proteomica_ad_nci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+proteinas_DA_ad_nci <- top_proteomica_ad_nci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(proteinas_DA_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\proteinas_DA_ad_nci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_proteomica_ad_nci)
+```
+
+```{r}
+top_proteomica_ad_nci <- top_proteomica_ad_nci %>% 
+  mutate(DA = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                          "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_proteomica_ad_nci, aes(x = logFC, y = -log10(adj.P.Val), colour = DA)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque2",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. NCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DA_ad_nci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+```{r}
+#library(org.Hs.eg.db)
+#library(clusterProfiler)
+#library(AnnotationDbi)
+
+# Calculo los rankings
+rankings_ad_nci <- top_proteomica_ad_nci$logFC * 
+  (-log10(top_proteomica_ad_nci$P.Value))
+names(rankings_ad_nci) <- rownames(top_proteomica_ad_nci)
+
+# Ordeno los genes por ranking
+rankings_ad_nci <- sort(rankings_ad_nci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_ad_nci <- gseGO(rankings_ad_nci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "UNIPROT",
+                        seed=TRUE)
+
+write.table(as.data.frame(gsea_go_ad_nci), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\GSEA_AD_NCI\\GSEA_proteomica_ad_nci.csv")
+```
+
+```{r}
+# GSEA plot
+
+gseaplot2(gsea_go_ad_nci, geneSetID = 1:3, pvalue_table = TRUE)
+
+```
+
+```{r}
+# Dotplot
+# library(DOSE)
+dotplot(gsea_go_ad_nci, showCategory=10, split=".sign") + facet_grid(.~.sign) +
+  theme(axis.title = element_text(size=12, face="bold"),
+        axis.title.x = element_text(margin = margin(t=20, r=0, b=0, l=0)),    
+        strip.text = element_text(face="bold", size=9), 
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=6),
+        legend.text = element_text(size=8),
+        legend.title = element_text(face="bold", size=10),
+        legend.margin = margin(2, 0.5, 2, 0.5, "mm"))
+
+#ggsave("GSEA_AD_NCI\\dotplot_ad_nci.png", plot = last_plot())
+```
+
+```{r}
+# Calculo los foldchanges de los genes de la rank list
+foldChanges_ad_nci <- top_proteomica_ad_nci[match(names(rankings_ad_nci),
+              rownames(top_proteomica_ad_nci)),]$logFC
+names(foldChanges_ad_nci) <- names(rankings_ad_nci)
+
+# Category netplot
+cnetplot(gsea_go_ad_nci, categorySize="pvalue", node_label = "category",
+         color.params = list(foldChange = foldChanges_ad_nci),
+         showCategory = 20,
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_NCI\\cnetplot_ad_nci_20.png", plot = last_plot())
+```
+
+Para los dos siguientes gráficos hace falta calcular primero la matriz de similitud de los términos de enriquecimiento, que proporciona una medida de cuán relacionados están los términos entre sí en función de su significado biológico.
+
+```{r}
+# calculo la matriz de similitud de términos usando Jaccard’s similarity index
+gsea_go_ad_nci_2 <- pairwise_termsim(gsea_go_ad_nci) 
+
+# Enrichment map
+ emapplot(gsea_go_ad_nci_2, showCategory = 20, color = "NES",
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_NCI\\emapplot_ad_nci_20.png", plot = last_plot())
+```
+
+```{r}
+# Treeplot
+treeplot(gsea_go_ad_nci_2, color = "NES",
+         fontsize = 3, offset.params = list(bar_tree = rel(2)))
+
+#ggsave("GSEA_AD_NCI\\treeplot_ad_nci.png", plot = last_plot())
+```
+
+## Diferencias de expresión entre los grupos AD y MCI
+
+```{r}
+# Visualizar los resultados (topTable)
+top_proteomica_ad_mci <- as.data.frame(topTable(fit_ebayes_prot, coef = 2, number = Inf))  
+
+# Guardo la salida
+write.table(top_proteomica_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\toptable_proteomica_ad_mci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+proteinas_DA_ad_mci <- top_proteomica_ad_mci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(proteinas_DA_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\proteinas_DA_ad_mci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_proteomica_ad_mci)
+```
+
+```{r}
+top_proteomica_ad_mci <- top_proteomica_ad_mci %>% 
+  mutate(DA = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                         "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_proteomica_ad_mci, aes(x = logFC, y = -log10(adj.P.Val), colour = DA)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque2",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. MCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DA_ad_mci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+```{r}
+# Calculo los rankings
+rankings_ad_mci <- top_proteomica_ad_mci$logFC * 
+  (-log10(top_proteomica_ad_mci$P.Value))
+names(rankings_ad_mci) <- rownames(top_proteomica_ad_mci)
+
+# Ordeno los genes por ranking
+rankings_ad_mci <- sort(rankings_ad_mci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_ad_mci <- gseGO(rankings_ad_mci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "UNIPROT",
+                        seed=TRUE)
+
+```
+
+No se ha podido realizar el GSEA a partir de la lista ordenada mediante la combinación del log fold change y el valor p. Esto probablemente se deba a que la variabilidad en los rankings es muy baja, no haiéndose encontrado diferencias significativas entre las distintas categorías (consultar el gráfico de los rankings).
+
+## Diferencias de expresión entre los grupos MCI y NCI
+
+```{r}
+# Visualizar los resultados (topTable)
+top_proteomica_mci_nci <- as.data.frame(topTable(fit_ebayes_prot, coef = 3, number = Inf))  
+
+# Guardo la salida
+write.table(top_proteomica_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\toptable_proteomica_mci_nci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+proteinas_DA_mci_nci <- top_proteomica_mci_nci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(proteinas_DA_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\proteinas_DA_mci_nci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_proteomica_mci_nci)
+```
+
+```{r}
+top_proteomica_mci_nci <- top_proteomica_mci_nci %>% 
+  mutate(DA = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                          "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_proteomica_mci_nci, aes(x = logFC, y = -log10(adj.P.Val), 
+                                   colour = DA)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque2",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "MCI vs. NCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DA_mci_nci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+```{r}
+# Calculo los rankings
+rankings_mci_nci <- top_proteomica_mci_nci$logFC * 
+  (-log10(top_proteomica_mci_nci$P.Value))
+names(rankings_mci_nci) <- rownames(top_proteomica_mci_nci)
+
+# Ordeno los genes por ranking
+rankings_mci_nci <- sort(rankings_mci_nci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_mci_nci <- gseGO(rankings_mci_nci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "UNIPROT",
+                        seed=TRUE)
+
+```
+No se ha podido realizar el GSEA a partir de la lista ordenada mediante la combinación del log fold change y el valor p. Esto probablemente se deba a que la variabilidad en los rankings es muy baja, no haiéndose encontrado diferencias significativas entre las distintas categorías.
+
+## Dos gráficos para analizar las tres comparaciones
+
+```{r}
+# Distribución de los valores p
+boxplot(top_proteomica_ad_nci$P.value, top_proteomica_ad_mci$P.value,
+        top_proteomica_mci_nci$P.value,
+        main = "Valores p", col = c("royalblue2", 
+                                    "darkolivegreen1",
+                                    "brown1"),
+        names = c("AD vs NCI", "AD vs MCI", "MCI vs NCI"))
+```
+
+
+
+```{r}
+# Distribución de los rankings
+
+layout(matrix(c(1,1,2,2,3,3), nrow = 2))
+plot(rankings_ad_nci, main = "AD vs NCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "royalblue2",
+     ylim = c(-3, 5))
+
+plot(rankings_ad_mci, main = "AD vs MCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "darkolivegreen1",
+     ylim = c(-3, 5))
+
+plot(rankings_mci_nci, main = "MCI vs NCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "brown1",
+     ylim = c(-3, 5))
+```
+
+# Preparación de los datos para la integración multiómica
+
+## Selección de las características más variables (HVGs)
+
+Las características (genes/regiones/proteínas) que no muestran o muestran poca variación deben ser eliminadas, ya que pueden causar problemas numéricos en el modelo.
+
+MOFA (https://www.bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/getting_started_R.html) recomienda seleccionar las características más variables para cada ensayo. Además, mis conjuntos de datos tienen diferentes tamaños; esto debe tenerse en cuenta seleccionando una cantidad similar de características para los tres, ya que las modalidades de datos más grandes tienden a estar sobrerepresentadas en el modelo de MOFA y el modelo podría perder fuentes de variación únicas para el conjunto de datos que sea más pequeño pequeño.
+
+Por otro lado, cuando el experimento tiene múltiples grupos (como sucede en este caso), MOFA recomienda ajustar el efecto de la variable de grupo en los datos antes de seleccionar las HGVs. Esto se debe a que MOFA+ no tiene como objetivo capturar cambios diferenciales en los niveles medios entre los grupos, sino comparar las fuentes de variabilidad que impulsan cada grupo. Es decir, en lugar de buscar diferencias directas entre los grupos, se busca la variabilidad dentro de cada grupo y cómo las diferentes fuentes de variabilidad pueden estar relacionadas con los diferentes grupos sin enfocarse en las diferencias directas entre ellos (https://biofam.github.io/MOFA2/faq.html).
+
+Además, Arguelaguet et al. (2020) señalan que el tamaño del grupo también afecta a la reconstrucción de los factores: los grupos más grandes tienden a tener un mayor peso en 
+
+
+Teniendo en cuenta esta información, lo que voy a hacer es dividir mi tabla normalizada por grupo experimental. En cada grupo voy a seleccionar las 5000 características (genes en este caso) más variables, aplicando la función `rowVars` del paquete `matrixStats`. Finalmente, haré una lista combinada de los HVGs de cada grupo y filtraré sobre la tabla inicial.
+
+```{r}
+# Extracción de los datos de cada grupo
+data_grupo_ad <- datos_proteomicos[, c(which(grupos_proteomicos 
+                                             == "AD"))]
+
+data_grupo_mci <- datos_proteomicos[, c(which(grupos_proteomicos == 
+                                                "MCI"))]
+
+data_grupo_nci <- datos_proteomicos[, c(which(grupos_proteomicos == 
+                                                "NCI"))]
+```
+
+
+```{r}
+# Extracción de los genes más variables por grupo
+varProteinas_ad <- rowVars(as.matrix(data_grupo_ad))
+topvarProteinas_ad <- names(head(varProteinas_ad[order(-varProteinas_ad)], 5000))
+
+varProteinas_mci <- rowVars(as.matrix(data_grupo_mci))
+topvarProteinas_mci <- names(head(varProteinas_mci[order(-varProteinas_mci)], 5000))
+
+varProteinas_nci <- rowVars(as.matrix(data_grupo_nci))
+topvarProteinas_nci <- names(head(varProteinas_nci[order(-varProteinas_nci)], 5000))
+
+# Combinación de los tres grupos
+topvarProteinas <- unique(c(topvarProteinas_ad, topvarProteinas_mci, topvarProteinas_nci))
+```
+
+```{r}
+# Generación de la tabla con los HVGs
+proteomic_topvarProteinas <- datos_proteomicos[topvarProteinas,]
+```
+
+## Exportación de la tabla normalizada
+
+Exporto la tabla de contajes normalizados mediante TMM, convertidos en CPM y con los HVGs para realizar la integración multiómica.
+
+```{r}
+write.table(proteomic_topvarProteinas, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\proteomica_HVG.csv")
+```
+
+# Bibliografía
+
++ Chen, C.; Hou, J.; Tanner, J.J.; Cheng, J. Bioinformatics Methods for Mass Spectrometry-Based Proteomics Data Analysis. Int. J. Mol. Sci. 2020, 21, 2873. https://doi.org/10.3390/ijms21082873
++ Huang T, Choi M, Tzouros M, Golling S, Pandya NJ, Banfai B, Dunkley T, Vitek O. MSstatsTMT: Statistical Detection of Differentially Abundant Proteins in Experiments with Isobaric Labeling and Multiple Mixtures. Mol Cell Proteomics. 2020 Oct;19(10):1706-1723. doi: 10.1074/mcp.RA120.002105. Epub 2020 Jul 17. PMID: 32680918; PMCID: PMC8015007.
++ Kammers, K., Cole, R. N., Tiengwe, C., & Ruczinski, I. (2015). Detecting significant changes in protein abundance. EuPA Open Proteomics, 7, 11–19. https://doi.org/10.1016/j.euprot.2015.02.002
+
+
+
+
+
+
+

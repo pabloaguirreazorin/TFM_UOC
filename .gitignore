@@ -1,0 +1,35 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.RDataTmp
+
+# Carpeta con los archivos ROSMAP (privados)
+archivos_ROSMAP/
+
+# Archivos ROSMAP preparados tras la exploración inicial (privados)
+contajes_rnaseq.csv
+metadatos_rnaseq.csv
+metadatos_metilacion.tsv
+datos_metilacion.csv
+pacientes_metilacion.csv
+datos_proteomicos.csv
+pacientes_proteomicos.csv
+rnaseq_normalizado.csv
+pacientes_multiomicos.csv
+metilacion_HVG.csv
+proteomica_HVG.csv
+RNAseq_HVG.csv
+datos_multiomicos.csv
+
+# Archivos que no tienen nada que ver con este análisis
+protocolos_analisis_metilacion.R
+protocolos_analisis_rnaseq.R
+
+# Archivos demasiado pesados
+toptable_metilacion_ad_nci.csv
+toptable_metilacion_mci_nci.csv
+metilacion_topDMC.csv
+toptable_metilacion_ad_mci.csv
+datos_mofa_ad.csv
+datos_multiomicos_top.csv

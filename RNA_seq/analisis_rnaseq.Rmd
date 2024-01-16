@@ -1,0 +1,799 @@
+---
+title: "analisis_rnaseq"
+author: "Pablo Aguirre Azorín"
+date: "2023-11-13"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(edgeR)
+library(org.Hs.eg.db)
+library(clusterProfiler) #GSEA
+library(DOSE) # Dotplot
+library(enrichplot) # Gráficas del GSEA
+library(AnnotationDbi)
+library(matrixStats) # Función rowVars
+```
+
+---
+
+\newpage
+
+# Introducción
+
+Existen numerosos métodos a la hora de abordar un análisis de genes diferencialmente expresados a partir de datos RNA-seq. Ello se debe por un lado a que el mejor método varía en cada caso, ya que la principal diferencia radica en el modelo probabilístico empleado, y éste depende de las características propias del experimento. Por otro lado, la realidad es que no hay un consenso respecto a la modalidad estadística que hay que emplear.
+
+Prueba de ello es la gran cantidad de paquetes de Bioconductor desarrollados:
+
+En primer lugar nos encontramos los enfoques paramétricos, entre los que encontramos DESeq2 y edgeR (basados en la distribución binomial negativa), limma-voom (basado en modelo lineal), baySeq (bayesiano basado en binomial negativa) o DESeq (distribución de poisson), entre otros. También existen métodos que tienen un enfoque no paramétrico, como NOISeq, dearseq y Wilcoxon rank-sum test.
+
+Los paquetes más utilizados para realizar el análisis de expresión diferencial, son limma, edgeR y DESeq2. Los tres métodos tienen sus propias ventajas, y la elección solo depende del tipo de datos (Liu et al., 2021).
+
+Sin embargo, Li et al. (2022) han observado que, cuando el tamaño muestral es superior a 8 muestras por grupo, el método no paramétrico Wilcoxon rank-sum test funciona mucho mejor que cualquier otro. No solo eso, sino que cuando el tamaño muestral es del orden de docenas ninguno de los tres métodos paramétricos (edgeR, Limma o DESeq2) se comporta correctamente, al infringirse los supuestos paramétricos (fallando el control de FDR). En ese caso, se recomienda usar el Wilcoxon rank-sum test.
+
+Esto mismo señalan Zhang et al (2019):
+
+"En general, el test de Wilcoxon sin transformación de datos se puede usar para detectar diferencias en los transcritos génicos expresados de manera diferente en datos de RNA-seq cuando el tamaño de la muestra es grande y los tamaños de las bibliotecas de muestras son desiguales. Si se prefiere la transformación de datos, entonces se puede usar limma con voom, l, r2 o lv2 en este escenario. El test de Wilcoxon sin transformación de datos tuvo un rendimiento mejor que el análisis de limma basado en 9 transformaciones de datos en estudios de simulación cuando los tamaños de las muestras no son demasiado pequeños y los tamaños de las bibliotecas de muestras son desiguales".
+
+Por tanto, el análisis de expresión diferencial se realiza en este caso mediante el protocolo de Wilcoxon rank-sum test propuesto en Li et al (2022). 
+
+# Carga de los datos
+
+```{r}
+# Carga de los datos para análisis rnaseq
+datos_rnaseq <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\contajes_rnaseq.csv", check.names = FALSE)
+metadatos_rnaseq <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\metadatos_rnaseq.csv", check.names = FALSE)
+```
+
+Como se observa en la salida inferior, se parte de una tabla de contajes brutos, en la que cada fila representa un gen y cada columna, una muestra. Respecto a los IDs de las muestras, en la fase de exploración fueron editados para que contuvieran el grupo al que pertenecen (AD, MCI o NCI) y así facilitar el análisis.
+
+```{r}
+# Mostrar cabecera de la tabla de contajes
+head(datos_rnaseq[, 1:5])
+```
+
+# Creación del objeto DGEList
+
+Primeramente extraigo los grupos de las muestras y modifico los id de los genes, eliminando la versión.
+
+```{r}
+# Extracción de los genes y eliminación de la versión
+genes_rnaseq <- datos_rnaseq[, 1]
+genes_rnaseq <- sapply(strsplit(genes_rnaseq, "\\."), function(x) head(x, 1))
+
+# Renombro los genes
+datos_rnaseq[, 1] <- genes_rnaseq
+
+# Extracción de los grupos de las muestras
+id_muestras <- colnames(datos_rnaseq)[-1]
+grupos_muestras <- sapply(strsplit(id_muestras, "_"), function(x) tail(x, 1))
+```
+
+Genero el objeto DGEList.
+
+```{r}
+# Objeto DGEList
+dge <- DGEList(counts = datos_rnaseq, 
+                group = grupos_muestras)
+```
+
+# Normalización
+
+Está debatido el uso de la normalización y la transformación a CPM. Zhang et al (2019) sugiere aplicar el wilcoxon test directamente sobre los contajes. Pero en el protocolo que estoy siguiendo (Li et al 2022) se realiza la normalización y la transformación a CPM. Similar procedimiento respecto a la transformación en CPM se sugiere en el soporte técnico de bioconductor. Por tanto, me decanto por realizar una normalización TMM y conversión a CPMs.
+
+```{r}
+# Normalización TMM
+dge_normalizado <- calcNormFactors(dge)
+
+# Conversión en CPM
+dge_normalizado <- as.data.frame(cpm(dge_normalizado))
+
+# Asignación de los genes a cada una de las filas
+rownames(dge_normalizado) <- datos_rnaseq$gene_id[as.numeric(rownames(dge_normalizado))]
+```
+
+# Análisis de expresión diferencial
+
+Para el análisis de expresión diferencial se realiza el Wilcoxon rank-sum test para cada gen.
+
+```{r}
+# Inicializo una matriz para almacenar los pvalues
+# Tendrá tantas columnas como combinaciones entre grupos (cada columna tendrá
+# el pvalor de la comparaciónn entre dos grupos) y tantas filas como genes
+grupos_unicos <- unique(grupos_muestras)
+pvalues <- data.frame(matrix(NA, nrow = nrow(dge_normalizado), 
+                  ncol = choose(length(grupos_unicos), 2)))
+
+# Realizar las pruebas de Wilcoxon por pares
+contador = 0 # Con esta variable selecciono la columna de pvalues que modifico
+for (i in 1:(length(grupos_unicos)-1)) {
+  for (j in (i+1):length(grupos_unicos)) {
+    grupo1 <- grupos_unicos[i]
+    grupo2 <- grupos_unicos[j]
+    contador <- contador + 1
+    
+    # Subconjunto de datos para los dos grupos
+    data_subset <- dge_normalizado[, grupos_muestras %in% c(grupo1, grupo2)]
+    id_subset <- colnames(dge_normalizado[, grupos_muestras %in% 
+                                            c(grupo1, grupo2)])
+    grupos_subset <- sapply(strsplit(id_subset, "_"), function(x) tail(x, 1))
+    
+    # Calculo el p valor de esa combinacion de grupos
+    pvalues[, contador] <- sapply(1:nrow(data_subset),function(z){
+      data<-cbind.data.frame(gene=as.numeric(t(data_subset[z, ])),
+                             grupos_subset)
+      p=wilcox.test(gene~grupos_subset, data)$p.value
+      return(p)
+      })
+    
+    # Para identificar la combinación, cambio el nombre de la columna
+    colnames(pvalues)[contador] <- paste(unique(grupos_subset), 
+                                           collapse = "_")
+  }
+}
+```
+
+Ajuste los p valores para controlar el FDR.
+
+```{r}
+# Ajuste de los p valores
+fdr <- as.data.frame(sapply(as.data.frame(pvalues), p.adjust, method = "fdr"))
+```
+
+Extraigo los datos de los distintos grupos.
+
+```{r}
+# Datos de los distintos grupos
+data_grupo_ad <- dge_normalizado[,c(which(grupos_muestras == "AD"))]
+data_grupo_mci <- dge_normalizado[,c(which(grupos_muestras == "MCI"))]
+data_grupo_nci <- dge_normalizado[,c(which(grupos_muestras == "NCI"))]
+```
+
+## Diferencias de expresión entre los grupos AD y NCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_ad_nci=log2(rowMeans(data_grupo_ad)/rowMeans(data_grupo_nci))
+
+# Salida final basada en el FDR
+salida_ad_nci <- data.frame(log2foldChange=foldChanges_ad_nci, 
+                        pValues=pvalues$AD_NCI, 
+                        FDR=fdr$AD_NCI)
+
+salida_ad_nci <- na.omit(salida_ad_nci) # elimino filas con na
+# Elimino valores infinitos (los he examinado previamente)
+salida_ad_nci <- salida_ad_nci[is.finite(salida_ad_nci$`log2foldChange`),] 
+
+# Ahora voy a añadir dos columnas, indicando el símbolo y el nombre de cada gen
+
+#library(org.Hs.eg.db)
+#library(AnnotationDbi)
+infogenes_ad_nci <- select(org.Hs.eg.db, 
+                           keys = rownames(salida_ad_nci), 
+                           columns = c("SYMBOL", "GENENAME",
+                                       "GENETYPE"), 
+                           keytype = "ENSEMBL") %>%
+  group_by(ENSEMBL) %>%
+  summarize(SYMBOL = paste(unique(SYMBOL), collapse = ","), 
+            GENENAME = paste(unique(GENENAME), collapse = ","),
+            GENETYPE = paste(unique(GENETYPE), collapse = ",")) %>%
+  ungroup()
+
+
+salida_ad_nci <- salida_ad_nci %>% 
+  mutate(symbol = infogenes_ad_nci$SYMBOL[match(rownames(.),
+                                 infogenes_ad_nci$ENSEMBL)],
+         gene_name = infogenes_ad_nci$GENENAME[match(rownames(.),
+                                 infogenes_ad_nci$ENSEMBL)],
+         gene_type = infogenes_ad_nci$GENETYPE[match(rownames(.),
+                                 infogenes_ad_nci$ENSEMBL)],
+         .before = log2foldChange)
+
+# Guardo la salida
+write.table(salida_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_ad_nci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05
+genes_DE_ad_nci <- salida_ad_nci %>% 
+  filter(FDR < umbral) %>% 
+  arrange(desc(abs(`log2foldChange`)))
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_ad_nci.csv")
+```
+
+```{r}
+# Lista de todos los ensemblIDs en tu conjunto de datos
+ensembl_ids <- unique(row.names(salida_ad_nci))
+
+prueba <- select(org.Hs.eg.db, 
+                           keys = rownames(salida_ad_nci), 
+                           columns = keytypes(org.Hs.eg.db), 
+                           keytype = "ENSEMBL")
+```
+
+
+```{r}
+salida_ad_nci <- salida_ad_nci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_ad_nci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. NCI")  +
+  scale_x_continuous(limits = c(-10, +10)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_ad_nci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+Para la generación de la lista clasificada no voy a tener en cuenta solo el fold change o el valor p, ya que en caso de tener en cuenta solo el fold change, se va a cometer el error de clasificar en función del efecto biológico, pero sin tener en cuenta la significación estadística de dicho efecto.
+
+En cambio, si se tiene en cuenta únicamente el valor p, se cometerá el error contrario: se le dará un peso excesivo a aquellos genes con un bajo valor p (alto efecto estadístico), pero cuyo fold change es bajo (bajo o nulo efecto biológico).
+
+Por tanto, para la generación de la lista clasificada lo mejor es tener en cuenta ambos criterios. Eso lo hago siguiendo la fórmula comentada en el artículo de Yufei et al., (2014).
+
+```{r}
+#library(org.Hs.eg.db)
+#library(clusterProfiler)
+#library(AnnotationDbi)
+
+# Calculo los rankings
+rankings_ad_nci <- salida_ad_nci$log2foldChange * (-log10(
+  salida_ad_nci$pValues))
+names(rankings_ad_nci) <- rownames(salida_ad_nci)
+rankings_ad_nci <- rankings_ad_nci[is.finite(rankings_ad_nci)]
+
+# Ordeno los genes por ranking
+rankings_ad_nci <- sort(rankings_ad_nci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_ad_nci <- gseGO(rankings_ad_nci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "ENSEMBL",
+                        seed=TRUE)
+
+write.table(as.data.frame(gsea_go_ad_nci), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\GSEA_AD_NCI\\GSEA_rnaseq_ad_nci.csv")
+```
+
+```{r}
+# GSEA plot
+
+gseaplot2(gsea_go_ad_nci, geneSetID = 1:3, pvalue_table = TRUE)
+```
+
+```{r}
+# Dotplot
+# library(DOSE)
+dotplot(gsea_go_ad_nci, showCategory=10, split=".sign") + facet_grid(.~.sign) +
+  theme(axis.title = element_text(size=12, face="bold"),
+        axis.title.x = element_text(margin = margin(t=20, r=0, b=0, l=0)),    
+        strip.text = element_text(face="bold", size=9), 
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=7),
+        legend.text = element_text(size=8),
+        legend.title = element_text(face="bold", size=10),
+        legend.margin = margin(2, 0.5, 2, 0.5, "mm"))
+
+#ggsave("GSEA_AD_NCI\\dotplot_ad_nci.png", plot = last_plot())
+```
+
+```{r}
+# Calculo los foldchanges de los genes de la rank list
+foldChanges_ad_nci <- salida_ad_nci[names(rankings_ad_nci),]$log2foldChange
+names(foldChanges_ad_nci) <- names(rankings_ad_nci)
+
+# Category netplot
+cnetplot(gsea_go_ad_nci, categorySize="pvalue", node_label = "category",
+         color.params = list(foldChange = foldChanges_ad_nci),
+         showCategory = 20,
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_NCI\\cnetplot_ad_nci_20.png", plot = last_plot())
+```
+
+Para los dos siguientes gráficos hace falta calcular primero la matriz de similitud de los términos de enriquecimiento, que proporciona una medida de cuán relacionados están los términos entre sí en función de su significado biológico.
+
+```{r}
+# calculo la matriz de similitud de términos usando Jaccard’s similarity index
+gsea_go_ad_nci_2 <- pairwise_termsim(gsea_go_ad_nci) 
+
+# Enrichment map
+ emapplot(gsea_go_ad_nci_2, showCategory = 20, color = "NES",
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_NCI\\emapplot_ad_nci_20.png", plot = last_plot())
+```
+
+```{r}
+# Treeplot
+treeplot(gsea_go_ad_nci_2, color = "NES",
+         fontsize = 3, offset.params = list(bar_tree = rel(2)))
+
+#ggsave("GSEA_AD_NCI\\treeplot_ad_nci.png", plot = last_plot())
+```
+
+
+## Diferencias de expresión entre los grupos AD y MCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_ad_mci=log2(rowMeans(data_grupo_ad)/rowMeans(data_grupo_mci))
+
+# Salida final basada en el FDR
+salida_ad_mci <- data.frame(log2foldChange=foldChanges_ad_mci, 
+                        pValues=pvalues$AD_MCI, 
+                        FDR=fdr$AD_MCI)
+
+salida_ad_mci <- na.omit(salida_ad_mci) # elimino filas con na
+# Elimino valores infinitos (los he examinado previamente)
+salida_ad_mci <- salida_ad_mci[is.finite(salida_ad_mci$`log2foldChange`),] 
+
+# Ahora voy a añadir dos columnas, indicando el símbolo y el nombre de cada gen
+
+#library(org.Hs.eg.db)
+#library(AnnotationDbi)
+infogenes_ad_mci <- select(org.Hs.eg.db, 
+                           keys = rownames(salida_ad_mci), 
+                           columns = c("SYMBOL", "GENENAME",
+                                       "GENETYPE"), 
+                           keytype = "ENSEMBL") %>%
+  group_by(ENSEMBL) %>%
+  summarize(SYMBOL = paste(unique(SYMBOL), collapse = ","), 
+            GENENAME = paste(unique(GENENAME), collapse = ","),
+            GENETYPE = paste(unique(GENETYPE), collapse = ",")) %>%
+  ungroup()
+
+
+salida_ad_mci <- salida_ad_mci %>% 
+  mutate(symbol = infogenes_ad_nci$SYMBOL[match(rownames(.),
+                                 infogenes_ad_mci$ENSEMBL)],
+         gene_name = infogenes_ad_mci$GENENAME[match(rownames(.),
+                                 infogenes_ad_mci$ENSEMBL)],
+         gene_type = infogenes_ad_mci$GENETYPE[match(rownames(.),
+                                 infogenes_ad_mci$ENSEMBL)],
+         .before = log2foldChange)
+
+
+# Guardo la salida
+write.table(salida_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_ad_mci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05
+genes_DE_ad_mci <- salida_ad_mci %>% 
+  filter(FDR < umbral) %>% 
+  arrange(desc(abs(`log2foldChange`)))
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_ad_mci.csv")
+```
+
+```{r}
+salida_ad_mci <- salida_ad_mci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_ad_mci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. MCI")  +
+  scale_x_continuous(limits = c(-10, +10)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_ad_mci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+```{r}
+#library(org.Hs.eg.db)
+#library(clusterProfiler)
+#library(AnnotationDbi)
+
+# Calculo los rankings
+rankings_ad_mci <- salida_ad_mci$log2foldChange * (-log10(
+  salida_ad_mci$pValues))
+names(rankings_ad_mci) <- rownames(salida_ad_mci)
+rankings_ad_mci <- rankings_ad_mci[is.finite(rankings_ad_mci)]
+
+# Ordeno los genes por ranking
+rankings_ad_mci <- sort(rankings_ad_mci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_ad_mci <- gseGO(rankings_ad_mci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "ENSEMBL",
+                        seed=TRUE)
+
+write.table(as.data.frame(gsea_go_ad_mci), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\GSEA_AD_MCI\\GSEA_rnaseq_ad_mci.csv")
+```
+
+```{r}
+# GSEA plot
+
+gseaplot2(gsea_go_ad_mci, geneSetID = 1:3, pvalue_table = TRUE)
+
+```
+
+```{r}
+# Dotplot
+# library(DOSE)
+dotplot(gsea_go_ad_mci, showCategory=8, split=".sign") + facet_grid(.~.sign) +
+  theme(axis.title = element_text(size=12, face="bold"),
+        axis.title.x = element_text(margin = margin(t=20, r=0, b=0, l=0)),    
+        strip.text = element_text(face="bold", size=9), 
+        axis.text.x = element_text(size=12),
+        axis.text.y = element_text(size=12),
+        legend.text = element_text(size=10),
+        legend.title = element_text(face="bold", size=10),
+        legend.margin = margin(2, 1, 2, 1, "mm"))
+
+#ggsave("GSEA_AD_MCI\\dotplot_ad_mci.png", plot = last_plot())
+```
+
+```{r}
+# Calculo los foldchanges de los genes de la rank list
+foldChanges_ad_mci <- salida_ad_mci[names(rankings_ad_mci),]$log2foldChange
+names(foldChanges_ad_mci) <- names(rankings_ad_mci)
+
+# Category netplot
+cnetplot(gsea_go_ad_mci, categorySize="pvalue", node_label = "category",
+         color.params = list(foldChange = foldChanges_ad_mci),
+         showCategory = 20,
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_MCI\\cnetplot_ad_mci_20.png", plot = last_plot())
+```
+
+Para los dos siguientes gráficos hace falta calcular primero la matriz de similitud de los términos de enriquecimiento, que proporciona una medida de cuán relacionados están los términos entre sí en función de su significado biológico.
+
+```{r}
+# calculo la matriz de similitud de términos usando Jaccard’s similarity index
+gsea_go_ad_mci_2 <- pairwise_termsim(gsea_go_ad_mci) 
+
+# Enrichment map
+ emapplot(gsea_go_ad_mci_2, showCategory = 20, color = "NES",
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_AD_MCI\\emapplot_ad_mci_20.png", plot = last_plot())
+```
+
+```{r}
+# Treeplot
+treeplot(gsea_go_ad_mci_2, color = "NES",
+         fontsize = 3, offset.params = list(bar_tree = rel(2)))
+
+#ggsave("GSEA_AD_MCI\\treeplot_ad_mci.png", plot = last_plot())
+```
+
+## Diferencias de expresión entre los grupos MCI y NCI
+
+```{r}
+# Cálculo del fold-change para cada gen
+foldChanges_mci_nci=log2(rowMeans(data_grupo_mci)/rowMeans(data_grupo_nci))
+
+# Salida final basada en el FDR
+salida_mci_nci <- data.frame(log2foldChange=foldChanges_mci_nci, 
+                        pValues=pvalues$MCI_NCI, 
+                        FDR=fdr$MCI_NCI)
+
+salida_mci_nci <- na.omit(salida_mci_nci) # elimino filas con na
+# Elimino valores infinitos (los he examinado previamente)
+salida_mci_nci <- salida_mci_nci[is.finite(salida_mci_nci$`log2foldChange`),] 
+
+# Ahora voy a añadir dos columnas, indicando el símbolo y el nombre de cada gen
+
+#library(org.Hs.eg.db)
+#library(AnnotationDbi)
+infogenes_mci_nci <- select(org.Hs.eg.db, 
+                           keys = rownames(salida_mci_nci), 
+                           columns = c("SYMBOL", "GENENAME",
+                                       "GENETYPE"), 
+                           keytype = "ENSEMBL") %>%
+  group_by(ENSEMBL) %>%
+  summarize(SYMBOL = paste(unique(SYMBOL), collapse = ","), 
+            GENENAME = paste(unique(GENENAME), collapse = ","),
+            GENETYPE = paste(unique(GENETYPE), collapse = ",")) %>%
+  ungroup()
+
+
+salida_mci_nci <- salida_mci_nci %>% 
+  mutate(symbol = infogenes_mci_nci$SYMBOL[match(rownames(.),
+                                 infogenes_mci_nci$ENSEMBL)],
+         gene_name = infogenes_mci_nci$GENENAME[match(rownames(.),
+                                 infogenes_mci_nci$ENSEMBL)],
+         gene_type = infogenes_mci_nci$GENETYPE[match(rownames(.),
+                                 infogenes_mci_nci$ENSEMBL)],
+         .before = log2foldChange)
+
+# Guardo la salida
+write.table(salida_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\toptable_rnaseq_mci_nci.csv")
+
+umbral <- 0.05
+# Selecciono aquellos genes con FDR <0.05
+genes_DE_mci_nci <- salida_mci_nci %>% 
+  filter(FDR < umbral) %>% 
+  arrange(desc(abs(`log2foldChange`)))
+
+# Guardar la tabla con los genes DE
+write.table(genes_DE_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\genes_DE_mci_nci.csv")
+```
+
+```{r}
+salida_mci_nci <- salida_mci_nci %>% 
+  mutate(DE = case_when((log2foldChange >=0.5 & FDR<0.05) ~ "UP",
+                        (log2foldChange <=-0.5 & FDR<0.05) ~ "DOWN",
+                        (FDR < 0.05 & log2foldChange > -0.5 & log2foldChange 
+                         < 0.5) ~ "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(salida_mci_nci, aes(x=log2foldChange, y = -log10(FDR), colour = DE)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "MCI vs. NCI")  +
+  scale_x_continuous(limits = c(-5, +5)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DE_mci_nci.png", plot = last_plot())
+```
+
+### Análisis GSEA
+
+```{r}
+#library(org.Hs.eg.db)
+#library(clusterProfiler)
+#library(AnnotationDbi)
+
+# Calculo los rankings
+rankings_mci_nci <- salida_mci_nci$log2foldChange * (-log10(
+  salida_mci_nci$pValues))
+names(rankings_mci_nci) <- rownames(salida_mci_nci)
+rankings_mci_nci <- rankings_mci_nci[is.finite(rankings_mci_nci)]
+
+# Ordeno los genes por ranking
+rankings_mci_nci <- sort(rankings_mci_nci, decreasing = TRUE)
+
+# Hago el GSEA (paquete clusterProfiler)
+# La ont puede ser:
+# BP: Biological processes
+# MP: Molecular function
+# CC: Celular component
+gsea_go_mci_nci <- gseGO(rankings_mci_nci,
+                        OrgDb = "org.Hs.eg.db",
+                        ont = "BP",
+                        keyType = "ENSEMBL",
+                        seed=TRUE)
+
+write.table(as.data.frame(gsea_go_mci_nci), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\GSEA_MCI_NCI\\GSEA_rnaseq_mci_nci.csv", row.names = FALSE)
+```
+
+```{r}
+# GSEA plot
+
+gseaplot2(gsea_go_mci_nci, geneSetID = 1:3, pvalue_table = TRUE) 
+
+```
+
+```{r}
+# Dotplot
+# library(DOSE)
+dotplot(gsea_go_mci_nci, showCategory=10, split=".sign") + facet_grid(.~.sign) +
+  theme(axis.title = element_text(size=12, face="bold"),
+        axis.title.x = element_text(margin = margin(t=20, r=0, b=0, l=0)),    
+        strip.text = element_text(face="bold", size=9), 
+        axis.text.x = element_text(size=10),
+        axis.text.y = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.title = element_text(face="bold", size=12),
+        legend.margin = margin(2, 1, 2, 1, "mm"))
+
+#ggsave("GSEA_MCI_NCI\\dotplot_mci_nci.png", plot = last_plot())
+```
+
+```{r}
+# Calculo los foldchanges de los genes de la rank list
+foldChanges_mci_nci <- salida_mci_nci[names(rankings_mci_nci),]$log2foldChange
+names(foldChanges_mci_nci) <- names(rankings_mci_nci)
+
+# Category netplot
+cnetplot(gsea_go_mci_nci, categorySize="pvalue", node_label = "category",
+         color.params = list(foldChange = foldChanges_mci_nci),
+         showCategory = 20,
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_MCI_NCI\\cnetplot_mci_nci_20.png", plot = last_plot())
+```
+
+Para los dos siguientes gráficos hace falta calcular primero la matriz de similitud de los términos de enriquecimiento, que proporciona una medida de cuán relacionados están los términos entre sí en función de su significado biológico.
+
+```{r}
+# calculo la matriz de similitud de términos usando Jaccard’s similarity index
+gsea_go_mci_nci_2 <- pairwise_termsim(gsea_go_mci_nci) 
+
+# Enrichment map
+emapplot(gsea_go_mci_nci_2, showCategory = 20, color = "NES",
+         cex.params = list(category_label = 0.5))
+
+#ggsave("GSEA_MCI_NCI\\emapplot_mci_NCI_20.png", plot = last_plot())
+```
+
+```{r}
+# Treeplot
+treeplot(gsea_go_mci_nci_2, color = "NES",
+         fontsize = 3, offset.params = list(bar_tree = rel(2)))
+
+#ggsave("GSEA_MCI_NCI\\treeplot_mci_nci.png", plot = last_plot())
+
+```
+
+## Dos gráficos para analizar las tres comparaciones
+
+```{r}
+# Distribución de los valores p
+boxplot(salida_ad_nci$pValues, salida_ad_mci$pValues,
+        salida_mci_nci$pValues,
+        main = "Valores p", col = c("royalblue2", 
+                                    "darkolivegreen1",
+                                    "brown1"),
+        names = c("AD vs NCI", "AD vs MCI", "MCI vs NCI"))
+```
+
+
+
+```{r}
+# Distribución de los rankings
+
+layout(matrix(c(1,1,2,2,3,3), nrow = 2))
+plot(rankings_ad_nci, main = "AD vs NCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "royalblue2",
+     ylim = c(-13, 13))
+
+plot(rankings_ad_mci, main = "AD vs MCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "darkolivegreen1",
+     ylim = c(-13, 13))
+
+plot(rankings_mci_nci, main = "MCI vs NCI",
+     xlab = "Rank in Ordered Dataset",
+     ylab = "Ranked List Metric",
+     col = "brown1",
+     ylim = c(-13, 13))
+```
+
+# Preparación de los datos para la integración multiómica
+
+## Selección de las características más variables (HVGs)
+
+Las características (genes/regiones/proteínas) que no muestran o muestran poca variación deben ser eliminadas, ya que pueden causar problemas numéricos en el modelo.
+
+MOFA (https://www.bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/getting_started_R.html) recomienda seleccionar las características más variables para cada ensayo. Además, mis conjuntos de datos tienen diferentes tamaños; esto debe tenerse en cuenta seleccionando una cantidad similar de características para los tres, ya que las modalidades de datos más grandes tienden a estar sobrerepresentadas en el modelo de MOFA y el modelo podría perder fuentes de variación únicas para el conjunto de datos que sea más pequeño pequeño.
+
+Por otro lado, cuando el experimento tiene múltiples grupos (como sucede en este caso), MOFA recomienda ajustar el efecto de la variable de grupo en los datos antes de seleccionar las HGVs. Esto se debe a que MOFA+ no tiene como objetivo capturar cambios diferenciales en los niveles medios entre los grupos, sino comparar las fuentes de variabilidad que impulsan cada grupo. Es decir, en lugar de buscar diferencias directas entre los grupos, se busca la variabilidad dentro de cada grupo y cómo las diferentes fuentes de variabilidad pueden estar relacionadas con los diferentes grupos sin enfocarse en las diferencias directas entre ellos (https://biofam.github.io/MOFA2/faq.html).
+
+Además, Arguelaguet et al. (2020) señalan que el tamaño del grupo también afecta a la reconstrucción de los factores: los grupos más grandes tienden a tener un mayor peso en 
+
+Teniendo en cuenta esta información, lo que voy a hacer es dividir mi tabla normalizada por grupo experimental. En cada grupo voy a seleccionar las 5000 características (genes en este caso) más variables, aplicando la función `rowVars` del paquete `matrixStats`. Finalmente, haré una lista combinada de los HVGs de cada grupo y filtraré sobre la tabla inicial.
+
+Antes de seleccionar los HVGs, voy a volver a normalizar y a convertir los datos a log2(CPM), para estabilizar la varianza, tal y como se recomienda en MOFA+.
+
+```{r}
+# Normalización TMM
+dge_normalizado <- calcNormFactors(dge)
+
+# Conversión en log CPM
+dge_normalizado <- as.data.frame(cpm(dge_normalizado,
+                                     log = TRUE))
+
+# Asignación de los genes a cada una de las filas
+rownames(dge_normalizado) <- datos_rnaseq$gene_id[as.numeric(rownames(dge_normalizado))]
+```
+
+```{r}
+# Extracción de los genes más variables por grupo
+varGenes_ad <- rowVars(as.matrix(data_grupo_ad))
+topVarGenes_ad <- names(head(varGenes_ad[order(-varGenes_ad)], 5000))
+
+varGenes_mci <- rowVars(as.matrix(data_grupo_mci))
+topVarGenes_mci <- names(head(varGenes_mci[order(-varGenes_mci)], 5000))
+
+varGenes_nci <- rowVars(as.matrix(data_grupo_nci))
+topVarGenes_nci <- names(head(varGenes_nci[order(-varGenes_nci)], 5000))
+
+# Combinación de los tres grupos
+topVarGenes <- unique(c(topVarGenes_ad, topVarGenes_mci, topVarGenes_nci))
+```
+
+```{r}
+# Generación de la tabla con los HVGs
+RNAseq_topVarGenes <- dge_normalizado[topVarGenes,]
+```
+
+## Exportación de la tabla normalizada
+
+Exporto la tabla de contajes normalizados mediante TMM, convertidos en CPM y con los HVGs para realizar la integración multiómica.
+
+```{r}
+write.table(RNAseq_topVarGenes, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\RNAseq_HVG.csv")
+```
+
+# Bibliografía
+
++ Argelaguet, R., Arnol, D., Bredikhin, D., Deloro, Y., Velten, B., Marioni, J. C., & Stegle, O. (2020). MOFA+: a statistical framework for comprehensive integration of multi-modal single-cell data. Genome Biology, 21(1). https://doi.org/10.1186/s13059-020-02015-1
++ Li, Y., Ge, X., Peng, F. et al. Exaggerated false positives by popular differential expression methods when analyzing human population samples. Genome Biol 23, 79 (2022). https://doi.org/10.1186/s13059-022-02648-4.
++ Liu, S., Wang, Z., Zhu, R., Wang, F., Cheng, Y., Liu, Y. Three Differential Expression Analysis Methods for RNA Sequencing: limma, EdgeR, DESeq2. J. Vis. Exp. (175), e62528, doi:10.3791/62528 (2021).
++ Yufei Xiao, Tzu-Hung Hsiao, Uthra Suresh, Hung-I Harry Chen, Xiaowu Wu, Steven E. Wolf, Yidong Chen, A novel significance score for gene selection and ranking, Bioinformatics, Volume 30, Issue 6, March 2014, Pages 801–807, https://doi.org/10.1093/bioinformatics/btr671
++ Zhang Z, Yu D, Seo M, Hersh CP, Weiss ST, Qiu W. Novel Data Transformations for RNA-seq Differential Expression Analysis. Sci Rep. 2019 Mar 18;9(1):4820. doi: 10.1038/s41598-019-41315-w. PMID: 30886278; PMCID: PMC6423143.
++ edgeR or wilcoxon rank test? Which is right?. https://support.bioconductor.org/p/117512/
++ https://biofam.github.io/MOFA2/faq.html
++ https://www.bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/getting_started_R.html
+
+
+

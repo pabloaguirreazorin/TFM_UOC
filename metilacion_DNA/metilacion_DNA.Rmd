@@ -1,0 +1,692 @@
+---
+title: "metilacion_DNA"
+author: "Pablo Aguirre Azorín"
+date: "2023-11-14"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(dplyr)
+library(ggplot2)
+library(minfi)
+library(limma)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(wateRmelon) # Función BMIQ
+library(RPMM) # Se requiere para aplicar la función BMIQ
+library(RColorBrewer) # paletas de colores predefinidas para la visualización de datos
+library(qqman) #Manhattan plot y qqplot
+library(missMethyl) # ORA
+library(methylGSA) # GSEA
+library(matrixStats) # Función rowVars
+```
+
+---
+
+\newpage
+
+# Introducción
+
+Los datos descargados se encuentran en la base de datos del AD Knowledge Portal (Synapse, 2017). Como se explica en dicho portal, se utilizó el Illumna HumanMethylation450 BeadChip.
+
+Concretamente, para la realización del análisis de metilación se ha descargado la tabla imputada, que recopila los valores beta de cada sonda en las distintas muestras y que ya ha sido sometida a un proceso de filtrado (eliminando las sondas de reactividad cruzada), imputación y control de calidad, de tal manera que se ha ajustado por edad, sexo (se han eliminado los cromosomas sexuales) y efecto batch. Como se explica en el repositorio de ROSMAP, los datos presentaban un fuerte efecto batch debido al uso de dos diferentes termocicladores.
+
+Los datos también habían sido sometidos previamente a una corrección de fondo y un ajuste del sesgo de color, usando el software GenomeStudio.
+
+# Carga de los datos
+
+```{r}
+datos_metilacion <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\datos_metilacion.csv", check.names = FALSE)
+pacientes_metilacion <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\pacientes_metilacion.csv", check.names = FALSE)
+metadatos_metilacion <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\metadatos_metilacion.tsv", sep = "\t", header = TRUE)
+```
+
+El Illumna HumanMethylation450 BeadChip presenta sitios de metilación en todo el genoma humano. Estos sitios de metilación pueden ser (Visone et al., 2019; Wu & Kuan, 2018):
+
++ Islas CpG (96%).
++ Shores: Regiones que se encuentra a una distancia no mayor de 2Kb de una isla CpG
++ Shelves: Regiones que se encuentran a una distancia de entre 2 y 4 Kb de una isla CpG.
++ Otras regiones genómicas (como el primer exón, la región 3’ UTR, etc.).
+
+```{r}
+unique(metadatos_metilacion$Island_Feature)
+```
+
+Una vez que se han cargado los datos, he realizado el análisis de metilación, inspirándome en el protocolo de Maksimovic et al., (2017) que utiliza los paquetes de Bioconductor `minfi` y `limma`. Sin embargo, en dicho portocolo se parte de los ficheros IDAT. En mi caso parto de una tabla que recopila los valores beta de cada sonda en las distintas muestras, por lo que el procedimiento que he seguido es algo diferente.
+
+# Generación del objeto `GenomicRatioSet`
+
+Este objeto (del paquete `minfi`) almacena los valores beta y es necesario para poder aplicar las funciones de `minfi`.
+
+```{r}
+# Extraigo los ids de las sondas
+probes <- datos_metilacion[,1]
+# Genero una matriz con los datos de metilación y asigno las sondas como nombres de las filas
+datos_metilacion_matriz <- as.matrix(datos_metilacion[,-1])
+rownames(datos_metilacion_matriz) <- probes
+```
+
+```{r}
+# Genero el objeto GenomicRatioSet
+metilacion_grs <- makeGenomicRatioSetFromMatrix(datos_metilacion_matriz, 
+                                                rownames = probes)
+
+# Elimino para no saturar memoria
+rm(datos_metilacion_matriz)
+```
+
+# Preprocesado
+
+Voy a eliminar los CpGs que se pueden ver afectados por la interferencia de SNPs. Para ello se aplica la función `dropLociWithSnps` de `minfi`.
+
+```{r}
+# Eliminación de Sondas con SNPs en el CpG (minfi)
+metilacion_grs_filtrado <- dropLociWithSnps(metilacion_grs)
+
+# Elimino para no saturar memoria
+rm(metilacion_grs)
+```
+
+En el protocolo he seguido, se recomienda usar los valores beta para las representaciones gráficas de los niveles de metilación en un locus, ya que su valor coincide aproximadamente con el porcentaje de metilación. Por otro lado, el uso de los valores m es más apropiado para realizar los tests estadísticos (y hacer el análisis de metilación diferencial). Por ello, obtengo los valores beta y m.
+
+Para obtener los valores beta, aplico la función `getBeta` de `minfi`
+
+```{r}
+# Obtención de los beta values
+bVals <- getBeta(metilacion_grs_filtrado)
+```
+
+En cambio, para la obtención de los valores m no voy a usar la función `getM` de `minfi`. Esto se debe a que esa función no permite añadir un valor de $\alpha$, que en este caso es muy necesario, para evitar valores m infinitos debido a que el valor beta valga 0.
+
+El cálculo de los valores m lo hago de manera manual. Teniendo en cuenta que (Du et al., 2010):
+
++ $\beta = \frac{M}{M + U}$
++ $valorM = \log_2{\frac{M + \alpha}{U + \alpha}}$
+
+* M es metilado y U es desmetilado.
+
+Entonces:
+
+$valorM = \log_2{\frac{\frac{M + \alpha}{M + U}}{\frac{U + \alpha}{M + U}}} = \log_2{\frac{\beta + \frac{\alpha}{M + U}}{1 - \beta + \frac{\alpha}{M + U}}}$
+
+Teniendo en cuenta que en Du et al. (2010) se indica que $\alpha = 1$ y que en los Illumina methylation data, más del 95% de los CpGs suelen tener intensidades (M + U) superiores a 1000, entonces el cálculo manual de los valores M quedaría de la siguiente forma:
+
+$valorM = \log_2{\frac{\beta + 0.001}{1 - \beta + 0.001}}$
+
+```{r}
+# Obtención de los m values
+mVals <- sapply(as.data.frame(bVals), 
+                function(x){log2((x + 0.001)/(1 - x + 0.001))})
+rownames(mVals) <- rownames(bVals)
+```
+
+```{r}
+# Extraigo un vector con los grupos de las distintas muestras 
+id_muestras_metilacion <- colnames(metilacion_grs_filtrado)
+grupos_muestras_metilacion <- sapply(strsplit(id_muestras_metilacion, "_"), 
+                                     function(x) tail(x, 1))
+
+# Elimino para no saturar memoria
+rm(metilacion_grs_filtrado)
+```
+
+Seguidamente genero un density plot que muestra la distribución de los valores beta de todas las regiones de metilación y otro con la distribución de los valores m.
+
+```{r}
+par(mfrow = c(1,2))
+# Density plot valores beta
+densityPlot(bVals, main = "Valores Beta", 
+            sampGroups = grupos_muestras_metilacion, legend = FALSE)
+legend("top", cex = 0.5,
+       legend = levels(factor(grupos_muestras_metilacion)),
+       text.col = brewer.pal(8, "Dark2"))
+
+# Density plot valores m
+densityPlot(mVals, main = "Valores M", xlab = "M",
+            sampGroups = grupos_muestras_metilacion, legend = FALSE)
+legend("topleft", cex = 0.5,
+       legend = levels(factor(grupos_muestras_metilacion)),
+       text.col = brewer.pal(8, "Dark2"))
+```
+
+Seguidamente he realizado un MDS plot. Como he indicado `gene.selection="common"`, se seleccionan los 1000 genes con mayor desviación estándar entre todas las muestras. Como se puede observar en los documentos adjuntos, también he realizado el MDS Plot con todos los genes y seleccionando los 500 genes con mayor desviación estándar.
+
+```{r}
+# MDS Plot (limma)
+plotMDS(mVals, top=1000, gene.selection="common", pch = 1,
+        col=brewer.pal(8, "Dark2")[factor(grupos_muestras_metilacion)])
+legend("topleft",
+       legend = levels(factor(grupos_muestras_metilacion)), 
+       text.col = brewer.pal(8, "Dark2"), bg="white", cex=0.7)
+```
+
+# Análisis de metilación diferencial usando `limma`
+
+```{r}
+# Matriz de diseño
+design <- model.matrix(~ 0 + grupos_muestras_metilacion)
+rownames(design) <- id_muestras_metilacion
+colnames(design) <- sort(unique(grupos_muestras_metilacion))
+
+
+# Matriz de contrastes para las comparaciones 
+contMatrix <- makeContrasts(AD - NCI,
+                            AD - MCI,
+                            MCI - NCI,
+                            levels = design)
+
+# Ajustar el modelo lineal
+fit <- lmFit(mVals, design)
+
+# Estimación de los contrastes
+fit_contrast <- contrasts.fit(fit, contMatrix)
+fit_ebayes <- eBayes(fit_contrast)
+
+# Test de significacion para cada CpG
+dt_fit <- decideTests(object = fit_ebayes)
+
+# Guardo el resumen de las diferencias en metilación
+write.table(summary(dt_fit), "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\resumen_DM.csv")
+
+summary(dt_fit)
+```
+
+## Diferencias de metilación entre los grupos AD y NCI
+
+```{r}
+# Obtengo los datos de anotación 450K
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+# Obtengo las anotaciones de las sondas que uso
+ann450kSub <- ann450k[match(rownames(mVals), ann450k$Name),
+                         c(1:4,18,19,24:26,31,32)]
+
+# Visualizar los resultados (topTable)
+top_metilacion_ad_nci <- as.data.frame(topTable(fit_ebayes, 
+                                                coef = 1,
+                                  number = Inf,
+                                  genelist = ann450kSub))  
+
+# Guardo la salida
+write.table(top_metilacion_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\toptable_metilacion_ad_nci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+regiones_DM_ad_nci <- top_metilacion_ad_nci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(regiones_DM_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\regiones_DM_ad_nci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_metilacion_ad_nci)
+```
+
+### Volcano plot
+
+```{r}
+top_metilacion_ad_nci <- top_metilacion_ad_nci %>% 
+  mutate(DM = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                          "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_metilacion_ad_nci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque1",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. NCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DM_ad_nci.png", plot = last_plot())
+```
+
+### Manhattan plot y qq plot
+
+```{r}
+#library(qqman)
+top_metilacion_ad_nci$chr <-
+  as.numeric(sub("chr", "", top_metilacion_ad_nci$chr))
+
+# Manhattan plot
+png("manhattan_ad_nci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+manhattan(top_metilacion_ad_nci, chr = "chr", bp = "pos", 
+          snp = "Name", p = "adj.P.Val", annotatePval = 0.01,
+          col = c("cadetblue4", "cadetblue2"), suggestiveline = FALSE,
+          genomewideline = FALSE)
+dev.off()
+```
+
+```{r}
+# qqplot
+png("qq_ad_nci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+qq(top_metilacion_ad_nci$adj.P.Val)
+dev.off()
+```
+
+### ORA
+
+Para ello voy a filtrar aquellos CpGs cuyo FDR sea inferior al 5% y aplico la función `gometh` del paquete `missMethyl`.
+
+```{r}
+# Todas las sondas utilizadas en el análisis componen el background
+probes <- rownames(top_metilacion_ad_nci)
+
+# Selecciono Los CpGs significativos
+SigCpG_ad_nci <- rownames(top_metilacion_ad_nci[
+  top_metilacion_ad_nci$adj.P.Val < 0.05,])
+
+# Aplico el ORA
+ora_ad_nci <- gometh(sig.cpg = SigCpG_ad_nci, 
+                     all.cpg = probes,
+                     plot.bias = TRUE)
+
+# Renombro la variable TERM y filtro
+ora_ad_nci <- ora_ad_nci %>% 
+  dplyr::rename(Term = TERM) %>% 
+  filter(ONTOLOGY == "BP") # Me quedo solo con los procesos biológicos
+```
+
+
+```{r}
+# Principales categorías
+topgo_ad_nci <- topGO(ora_ad_nci, number = 1000)
+
+write.table(ora_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\ORA\\ora_ad_nci.csv")
+
+write.table(topgo_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\ORA\\topgo_ad_nci.csv")
+```
+
+```{r}
+ggplot(topgo_ad_nci[1:20,], aes(x = Term, y = DE, fill = FDR)) +
+  geom_bar(stat = "identity") +
+  ylab("Counts") +
+  coord_flip() +
+  theme_bw()
+```
+
+### GSEA
+
+Para hacer el GSEA voy a utilizar la función `methylRRA` del paquete `methylGSA`.
+
+```{r}
+# Extraigo el vactor con los valores p
+p_ad_nci <- top_metilacion_ad_nci$P.Value
+names(p_ad_nci) <- rownames(top_metilacion_ad_nci)
+
+# Realizo el GSEA
+gsea_ad_nci <- methylRRA(cpg.pval = p_ad_nci, method = "GSEA")
+
+write.table(gsea_ad_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\GSEA\\gsea_ad_nci.csv")
+```
+
+```{r}
+# Barplot
+barplot(gsea_ad_nci, num = 20) + theme_classic()
+```
+
+## Diferencias de metilación entre los grupos AD y MCI
+
+```{r}
+# Visualizar los resultados (topTable)
+top_metilacion_ad_mci <- as.data.frame(topTable(fit_ebayes, coef = 2, 
+                                                number = Inf,
+                                                genelist = ann450kSub))  
+
+# Guardo la salida
+write.table(top_metilacion_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\toptable_metilacion_ad_mci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+regiones_DM_ad_mci <- top_metilacion_ad_mci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(regiones_DM_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\regiones_DM_ad_mci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_metilacion_ad_mci)
+```
+
+### Volcano plot
+
+```{r}
+top_metilacion_ad_mci <- top_metilacion_ad_mci %>% 
+  mutate(DM = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                          "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_metilacion_ad_mci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque2",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "AD vs. MCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DM_ad_mci.png", plot = last_plot())
+```
+
+### Manhattan plot y qqplot
+
+```{r}
+#library(qqman)
+top_metilacion_ad_mci$chr <-
+  as.numeric(sub("chr", "", top_metilacion_ad_mci$chr))
+
+# Manhattan plot
+png("manhattan_ad_mci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+manhattan(top_metilacion_ad_mci, chr = "chr", bp = "pos", 
+          snp = "Name", p = "adj.P.Val", annotatePval = 0.01,
+          col = c("cadetblue4", "cadetblue2"), suggestiveline = FALSE,
+          genomewideline = FALSE)
+dev.off()
+```
+
+```{r}
+# qqplot
+png("qq_ad_mci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+qq(top_metilacion_ad_mci$adj.P.Val)
+dev.off()
+```
+
+### ORA
+
+```{r}
+# Todas las sondas utilizadas en el análisis componen el background
+probes <- rownames(top_metilacion_ad_mci)
+
+# Selecciono Los CpGs significativos
+SigCpG_ad_mci <- rownames(top_metilacion_ad_mci[
+  top_metilacion_ad_mci$adj.P.Val < 0.05,])
+
+# Aplico el ORA
+ora_ad_mci <- gometh(sig.cpg = SigCpG_ad_mci, 
+                     all.cpg = probes,
+                     plot.bias = TRUE)
+
+# Renombro la variable TERM y filtro
+ora_ad_mci <- ora_ad_mci %>% 
+  dplyr::rename(Term = TERM) %>% 
+  filter(ONTOLOGY == "BP") # Me quedo solo con los procesos biológicos
+```
+
+
+```{r}
+# Principales categorías
+topgo_ad_mci <- topGO(ora_ad_mci, number = 1000)
+
+write.table(ora_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\ORA\\ora_ad_mci.csv")
+
+write.table(topgo_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\ORA\\topgo_ad_mci.csv")
+```
+
+```{r}
+ggplot(topgo_ad_mci[1:20,], aes(x = Term, y = DE, fill = FDR)) +
+  geom_bar(stat = "identity") +
+  ylab("Counts") +
+  coord_flip() +
+  theme_bw()
+```
+
+### GSEA
+
+Para hacer el GSEA voy a utilizar la función `methylRRA` del paquete `methylGSA`.
+
+```{r}
+# Extraigo el vactor con los valores p
+p_ad_mci <- top_metilacion_ad_mci$P.Value
+names(p_ad_mci) <- rownames(top_metilacion_ad_mci)
+
+# Realizo el GSEA
+gsea_ad_mci <- methylRRA(cpg.pval = p_ad_mci, method = "GSEA")
+
+write.table(gsea_ad_mci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\GSEA\\gsea_ad_mci.csv")
+```
+
+```{r}
+# Barplot
+barplot(gsea_ad_mci, num = 20) + theme_classic()
+```
+
+## Diferencias de metilación entre los grupos MCI y NCI
+
+```{r}
+# Visualizar los resultados (topTable)
+top_metilacion_mci_nci <- as.data.frame(topTable(fit_ebayes, coef = 3, 
+                                                 number = Inf,
+                                                genelist = ann450kSub))  
+
+# Guardo la salida
+write.table(top_metilacion_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\toptable_metilacion_mci_nci.csv")
+
+# Selecciono aquellas regiones con p.adjust <0.05
+regiones_DM_mci_nci <- top_metilacion_mci_nci %>% 
+  filter(adj.P.Val<0.05) %>% 
+  arrange(desc(abs(logFC)))
+
+# Guardo la lista de regones diferencialmente metiladas
+write.table(regiones_DM_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\regiones_DM_mci_nci.csv")
+
+# Muestra las primeras filas de los resultados
+head(top_metilacion_mci_nci)
+```
+
+### Volcano plot
+
+```{r}
+top_metilacion_mci_nci <- top_metilacion_mci_nci %>% 
+  mutate(DM = case_when((logFC >=0.5 & adj.P.Val<0.05) ~ "UP",
+                        (logFC <=-0.5 & adj.P.Val<0.05) ~ "DOWN",
+                        (adj.P.Val < 0.05 & logFC > -0.5 & logFC < 0.5) ~ 
+                          "SMALL CHANGE",
+                        TRUE ~ "NOT SIGNIFICANT"))
+
+# Volcano plot
+ggplot(top_metilacion_mci_nci, aes(x = logFC, y = -log10(adj.P.Val), colour = DM)) +
+  geom_point(size = 0.7) + theme_bw() + 
+  scale_color_manual(values = c("NOT SIGNIFICANT" = "grey", 
+                                "SMALL CHANGE" = "bisque2",
+                                "DOWN" = "brown1", "UP" = "royalblue")) +
+  geom_vline(xintercept = c(-0.5, 0.5), lwd = 0.8, lty = 4) +
+  geom_hline(yintercept = -log10(0.05), lwd = 0.8, lty = 4) + 
+  labs(x = "log2(fold change)",
+       y = "-log10(adj.p-value)",
+       title = "MCI vs. NCI")  +
+  scale_x_continuous(limits = c(-1, +1)) +
+  scale_y_continuous(limits = c(0, 12)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        legend.position = "right", 
+        legend.title = element_blank())
+
+ggsave("volcano_DM_mci_nci.png", plot = last_plot())
+```
+
+### Manhattan plot
+
+```{r}
+#library(qqman)
+top_metilacion_mci_nci$chr <-
+  as.numeric(sub("chr", "", top_metilacion_mci_nci$chr))
+
+# Manhattan plot
+png("manhattan_mci_nci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+manhattan(top_metilacion_mci_nci, chr = "chr", bp = "pos", 
+          snp = "Name", p = "adj.P.Val", annotatePval = 0.01,
+          col = c("cadetblue4", "cadetblue2"), suggestiveline = FALSE,
+          genomewideline = FALSE)
+dev.off()
+```
+
+```{r}
+# qqplot
+png("qq_mci_nci.png", width = 1200, height = 800, 
+    pointsize = 6, res = 200)
+qq(top_metilacion_mci_nci$adj.P.Val)
+dev.off()
+```
+
+### ORA
+
+```{r}
+# Todas las sondas utilizadas en el análisis componen el background
+probes <- rownames(top_metilacion_mci_nci)
+
+# Selecciono Los CpGs significativos
+SigCpG_mci_nci <- rownames(top_metilacion_mci_nci[
+  top_metilacion_mci_nci$adj.P.Val < 0.05,])
+
+length(SigCpG_mci_nci)
+```
+
+Como no se han detectado CpGs significativos, no se puede realizar el ORA.
+
+### GSEA
+
+Para hacer el GSEA voy a utilizar la función `methylRRA` del paquete `methylGSA`.
+
+```{r}
+# Extraigo el vactor con los valores p
+p_mci_nci <- top_metilacion_mci_nci$P.Value
+names(p_mci_nci) <- rownames(top_metilacion_mci_nci)
+
+# Realizo el GSEA
+gsea_mci_nci <- methylRRA(cpg.pval = p_mci_nci, method = "GSEA")
+
+write.table(gsea_mci_nci, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\GSEA\\gsea_mci_nci.csv")
+```
+
+```{r}
+# Barplot
+barplot(gsea_mci_nci, num = 20) + theme_classic()
+```
+
+# Preparación de los datos para la integración multiómica
+
+## Selección de las características más variables (HVGs)
+
+Las características (genes/regiones/proteínas) que no muestran o muestran poca variación deben ser eliminadas, ya que pueden causar problemas numéricos en el modelo.
+
+MOFA (https://www.bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/getting_started_R.html) recomienda seleccionar las características más variables para cada ensayo. Además, mis conjuntos de datos tienen diferentes tamaños; esto debe tenerse en cuenta seleccionando una cantidad similar de características para los tres, ya que las modalidades de datos más grandes tienden a estar sobrerepresentadas en el modelo de MOFA y el modelo podría perder fuentes de variación únicas para el conjunto de datos que sea más pequeño pequeño.
+
+Por otro lado, cuando el experimento tiene múltiples grupos (como sucede en este caso), MOFA recomienda ajustar el efecto de la variable de grupo en los datos antes de seleccionar las HGVs. Esto se debe a que MOFA+ no tiene como objetivo capturar cambios diferenciales en los niveles medios entre los grupos, sino comparar las fuentes de variabilidad que impulsan cada grupo. Es decir, en lugar de buscar diferencias directas entre los grupos, se busca la variabilidad dentro de cada grupo y cómo las diferentes fuentes de variabilidad pueden estar relacionadas con los diferentes grupos sin enfocarse en las diferencias directas entre ellos (https://biofam.github.io/MOFA2/faq.html).
+
+Además, Arguelaguet et al. (2020) señalan que el tamaño del grupo también afecta a la reconstrucción de los factores: los grupos más grandes tienden a tener un mayor peso en 
+
+
+Teniendo en cuenta esta información, lo que voy a hacer es dividir mi tabla normalizada por grupo experimental. En cada grupo voy a seleccionar las 5000 características (genes en este caso) más variables, aplicando la función `rowVars` del paquete `matrixStats`. Finalmente, haré una lista combinada de los HVGs de cada grupo y filtraré sobre la tabla inicial.
+
+```{r}
+# Extracción de los datos de cada grupo
+data_grupo_ad <- mVals[, c(which(grupos_muestras_metilacion 
+                                 == "AD"))]
+
+data_grupo_mci <- mVals[, c(which(grupos_muestras_metilacion 
+                                  == "MCI"))]
+
+data_grupo_nci <- mVals[, c(which(grupos_muestras_metilacion 
+                                  == "NCI"))]
+```
+
+
+```{r}
+# Extracción de los genes más variables por grupo
+varMetilacion_ad <- rowVars(as.matrix(data_grupo_ad))
+topvarMetilacion_ad <- names(head(varMetilacion_ad[order(-varMetilacion_ad)], 5000))
+
+varMetilacion_mci <- rowVars(as.matrix(data_grupo_mci))
+topvarMetilacion_mci <- names(head(varMetilacion_mci[order(-varMetilacion_mci)], 5000))
+
+varMetilacion_nci <- rowVars(as.matrix(data_grupo_nci))
+topvarMetilacion_nci <- names(head(varMetilacion_nci[order(-varMetilacion_nci)], 5000))
+
+# Combinación de los tres grupos
+topvarMetilacion <- unique(c(topvarMetilacion_ad, topvarMetilacion_mci, topvarMetilacion_nci))
+```
+
+```{r}
+# Generación de la tabla con los HVGs
+metilacion_topvarMetilacion <- mVals[topvarMetilacion,]
+```
+
+## Exportación de la tabla normalizada
+
+Exporto la tabla de valores M y con los HVGs para realizar la integración multiómica.
+
+```{r}
+write.table(metilacion_topvarMetilacion, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\metilacion_HVG.csv")
+```
+
+# Anexo
+
+Tras generar el objeto GenomicRatioSet y eliminar las sondas con SNPs, intenté realizar la la normalización BMIQ, que es la más recomendada para eliminar el sesgo de los tipos de sondas (Bhat & Jones, 2022). Para ello apliqué la función `BMIQ` del paquete wateRmelon. Esta función necesita un parámetro `design.v` que consiste en un vector que indica el tipo de cada una de las sondas. Para generar dicho vector, obtuve el objeto con los datos de anotación 450k.
+
+Sin embargo, como se muestra en las figuras anexas, dicha normalización la he descartado porque en este caso no ha sido capaz de eliminar el sesgo de los tipos de sondas. De hecho, el density plot se mostraba más heterogéneo.
+
+```{r, eval=FALSE}
+# Extraigo en un vector de 1 (tipo1) y 2 (tipo2) el tipo de cada una de las sondas
+matches <- match(rownames(metilacion_grs_filtrado), ann450k$Name)
+tipo_probes <- case_when(ann450k$Type[matches] == "I" ~ 1,
+                         TRUE ~ 2)
+
+# Elimino objetos para no saturar la memoria
+rm(ann450k, matches)
+
+# BMIQ (paquete wateRmelon)
+metilacion_grs_normalizado <- BMIQ(getBeta(metilacion_grs_filtrado), 
+                                   design.v = tipo_probes)
+```
+
+# Bibliografía
+
++ 2017. Synapse. https://dx.doi.org/10.7303/syn3157275
++ Bhat, B., Jones, G.T. (2022). Data Analysis of DNA Methylation Epigenome-Wide Association Studies (EWAS): A Guide to the Principles of Best Practice. In: Horsfield, J., Marsman, J. (eds) Chromatin. Methods in Molecular Biology, vol 2458. Humana, New York, NY. https://doi.org/10.1007/978-1-0716-2140-0_2
++ Du, P., Zhang, X., Huang, CC. et al. Comparison of Beta-value and M-value methods for quantifying methylation levels by microarray analysis. BMC Bioinformatics 11, 587 (2010). https://doi.org/10.1186/1471-2105-11-587
++ Maksimovic J, Phipson B and Oshlack A. A cross-package Bioconductor workflow for analysing methylation array data [version 3; peer review: 4 approved]. F1000Research 2017, 5:1281 (https://doi.org/10.12688/f1000research.8839.3)
++ Visone R, Bacalini MG, Di Franco S, Ferracin M, Colorito ML, Pagotto S, Laprovitera N, Licastro D, Di Marco M, Scavo E, Bassi C, Saccenti E, Nicotra A, Grzes M, Garagnani P, De Laurenzi V, Valeri N, Mariani-Costantini R, Negrini M, Stassi G, Veronese A. DNA methylation of shelf, shore and open sea CpG positions distinguish high microsatellite instability from low or stable microsatellite status colon cancer stem cells. Epigenomics. 2019 May 1;11(6):587-604. doi: 10.2217/epi-2018-0153. 
++ Wu, M.C. and Kuan, P.F., A guide to Illumina bead chip data analysis, in DNA Methylation Protocols, Tost J., Ed., of Methods in Molecular Biology, New York: Humana, 2018, vol. 1708, pp. 303–329. https://doi.org/10.1007/978-1-4939-7481-8_16
++ Xu Ren, Pei Fen Kuan, methylGSA: a Bioconductor package and Shiny app for DNA methylation data length bias adjustment in gene set testing, Bioinformatics, Volume 35, Issue 11, June 2019, Pages 1958–1959, https://doi.org/10.1093/bioinformatics/bty892
+
+
+
+
+
+

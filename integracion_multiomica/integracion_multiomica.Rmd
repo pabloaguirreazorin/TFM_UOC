@@ -1,0 +1,743 @@
+---
+title: "Integración multiómica"
+author: "Pablo Aguirre Azorín"
+date: "2023-12-11"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(msigdbr) # Gene Ontology
+library(MOFA2)
+```
+
+---
+
+\newpage
+
+# Introducción
+
+Existen numerosos métodos de integración multiómica. Como se resume en la tabla 2 del artículo (Athieniti & Spyrou, 2023), en función del objetivo, del tipo ómico de los datasets a integrar y de otros factores, tales como la presencia o no de missing data, habrá que decantarse por un método u otro.
+
+En mi caso, el objetivo es encontrar patrones moleculares asociados a la enfermedad, ya que dichos patrones podrían revelar mecanismos específicos del alzheimer. Debo utilizar por tanto el método de reducción de la dimensionalidad, ya que lo que se espera es que aquellas moléculas destacadas se encuentren significativamente enriquecidas (ADJUNTAR IMAGEN DEL ARTÍCULO).
+
+Teniendo en cuenta la información que hay en la tabla 2, el método que mejor se ajusta a mi problema es MOFA. Ello se debe a que es el único que combina las siguientes características:
+
++ Funciona con datasets epigenéticos, proteómicos y transcriptómicos.
++ Se puede utilizar para el objetivo de detectar patrones moleculares asociados a la enfermedad.
++ Funciona pese a la presencia de missing data (el dataset proteómico presenta numerosos NA).
+
+En el mismo artículo se explica que las integraciones enfocadas en la detección de patrones moleculares asociados a la enfermedad, suelen ir acompañadas de un análisis downstream, para anotar dichos patrones.
+
+Sin embargo, MOFA no ofrece un enfoque fundamentado para integrar múltiples grupos de muestras y modalidades de datos dentro del mismo marco de inferencia. Por ello se recomienda utilizar MOFA+, un método muy similar al anterior, pero que puede integrar múltiples ómicas y grupos de muestras (Argelaguet et al., 2020). 
+
+En la documentación del paquete `MOFA2` de `Bioconductor` se asegura que los datos multiómicos deben derivar de las mismas muestras y que, si bien se aceptan datos faltantes en algunas muestras para un tipo específico de datos, es crucial que haya una cantidad considerable de mediciones que se superpongan entre las muestras para realizar análisis o integraciones exitosas.
+
+MOFA+ hereda de MOFA su capacidad para manejar datos faltantes (Argelaguet et al., 2020). Concretamente, se ha observado que MOFA pudo reconstruir con precisión la dimensión latente hasta cuando la fracción de valores faltantes es de 0,8 (Argelaguet et al., 2018). ADJUNTAR FIGURA.
+
+Por ello, se han seleccionado todos los pacientes que poseen muestras en al menos dos ómicas.
+
+```{r}
+pacientes_multiomicos <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\pacientes_multiomicos.csv")
+```
+
+Dibujo un diagrama de Venn con el que se visualiza las muestras que hay.
+
+```{r}
+library(VennDiagram)
+
+# Diagrama de Venn
+venn <- venn.diagram(list(rnaseq = pacientes_multiomicos$individualID[
+  !is.na(pacientes_multiomicos$rnaseqID)], 
+                   metilacion = pacientes_multiomicos$individualID[
+  !is.na(pacientes_multiomicos$metilacionID)], 
+                   proteomica = pacientes_multiomicos$individualID[
+  !is.na(pacientes_multiomicos$proteomicID)]),
+             filename = "diagrama_venn.png",
+             fill = rainbow(3),
+             disable.logging = TRUE,
+             output = TRUE)
+```
+
+# Preparación de los datos
+
+## Generación de las tablas completas de cada ómica
+
+Voy a realizar una serie de modificaciones sobre las tablas de cada ómica:
+
++ Eliminación de las muestras que no se incluyen en el estudio
++ Modificación del id de las muestras por el id de los pacientes, para que el algoritmo de MOFA entienda qué muestras pertenecen a cada paciente.
++ Añadir una columna, llamada "feature" que contiene el id del gen/CpG/proteína, Esto me interesa para la generación de la entrada en MOFA
++ Añadir una columna con valores NA para cada paciente incluido en la integración ómica, pero que no posee muestra en esa ómica en concreto.
+
+```{r}
+# RNASeq
+rnaseq_hvg <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\RNAseq_HVG.csv", check.names = FALSE)
+
+# Extraigo la lista de genes HVG
+genes <- rownames(rnaseq_hvg)
+
+# Extraigo los nombres de las muestras
+muestras_rnaseq <- colnames(rnaseq_hvg)
+rnaseqID <- sapply(strsplit(muestras_rnaseq, "_"), function(x){
+  paste(x[-length(x)], collapse = "_")
+})
+# Renombro las muestras sin los grupos
+colnames(rnaseq_hvg) <- rnaseqID
+```
+
+```{r}
+# Generación de la tabla con todos los pacientes
+# Selecciono solo aquellas muestras que se incluyan en el análisis multiómico
+rnaseq_hvg_pacientes <- rnaseq_hvg %>% 
+  dplyr::select(intersect(pacientes_multiomicos$rnaseqID, rnaseqID)) %>% 
+  rename_all(~ pacientes_multiomicos$individualID[match(intersect(pacientes_multiomicos$rnaseqID, rnaseqID), pacientes_multiomicos$rnaseqID)]) %>% 
+  mutate(feature = rownames(.))
+
+# Creo una lista de los pacientes que no tienen muestra de RNA seq
+idpacientes_rnaseq_sinmuestras <- setdiff(pacientes_multiomicos$individualID,
+                      colnames(rnaseq_hvg_pacientes))
+# Añado una columna por cada paciente sin muestra de RNAseq con NA
+for (id in idpacientes_rnaseq_sinmuestras) {
+  rnaseq_hvg_pacientes[[id]] <- NA
+}
+```
+
+
+```{r}
+# Metilación
+metilacion_hvg <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\metilacion_HVG.csv")
+
+# Extraigo la lista de CpGs HVG
+CpGs <- rownames(metilacion_hvg)
+
+# Extraigo los nombres de las muestras
+muestras_metilacion <- colnames(metilacion_hvg)
+metilacionID <- sapply(strsplit(muestras_metilacion, "_"), function(x){
+  head(x, 1)
+})
+
+metilacionID <- sapply(strsplit(metilacionID, "\\."), function(x){
+  paste(x, collapse = "-")})
+
+# Renombro las muestras sin los grupos
+colnames(metilacion_hvg) <- metilacionID
+```
+
+```{r}
+# Generación de la tabla con todos los pacientes
+# Selecciono solo aquellas muestras que se incluyan en el análisis multiómico
+metilacion_hvg_pacientes <- metilacion_hvg %>% 
+  dplyr::select(intersect(pacientes_multiomicos$metilacionID, metilacionID)) %>% 
+  rename_all(~ pacientes_multiomicos$individualID[match(intersect(pacientes_multiomicos$metilacionID, metilacionID), pacientes_multiomicos$metilacionID)]) %>% 
+  mutate(feature = rownames(.))
+
+# Creo una lista de los pacientes que no tienen muestra de metilacion
+idpacientes_metilacion_sinmuestras <- setdiff(pacientes_multiomicos$individualID,
+                                              colnames(metilacion_hvg_pacientes))
+# Añado una columna por cada paciente sin muestra de metilacion con NA
+for (id in idpacientes_metilacion_sinmuestras) {
+  metilacion_hvg_pacientes[[id]] <- NA
+}
+```
+
+
+```{r}
+# Proteómica
+proteomica_hvg <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\proteomica_HVG.csv")
+
+# Extraigo la lista de proteínas HVG
+proteinas <- rownames(proteomica_hvg)
+
+# Extraigo los nombres de las muestras
+muestras_proteinas <- colnames(proteomica_hvg)
+proteomicID <- sapply(strsplit(muestras_proteinas, "_"), function(x){
+  head(x, 1)
+})
+
+# Renombro las muestras sin los grupos
+colnames(proteomica_hvg) <- proteomicID
+```
+
+```{r}
+# Generación de la tabla con todos los pacientes
+# Selecciono solo aquellas muestras que se incluyan en el análisis multiómico
+proteomica_hvg_pacientes <- proteomica_hvg %>% 
+  dplyr::select(intersect(pacientes_multiomicos$proteomicID, proteomicID)) %>% 
+  rename_all(~ pacientes_multiomicos$individualID[match(intersect(pacientes_multiomicos$proteomicID, proteomicID), pacientes_multiomicos$proteomicID)]) %>% 
+  mutate(feature = rownames(.))
+
+# Creo una lista de los pacientes que no tienen muestra de metilacion
+idpacientes_proteomica_sinmuestras <- setdiff(pacientes_multiomicos$individualID,
+                                              colnames(proteomica_hvg_pacientes))
+# Añado una columna por cada paciente sin muestra de metilacion con NA
+for (id in idpacientes_proteomica_sinmuestras) {
+  proteomica_hvg_pacientes[[id]] <- NA
+}
+```
+
+## Generación del data frame multiomico
+
+En la documentación del paquete `MOFA2` se explica que cuando se tiene un experimento de múltiples modalidades de datos (ómicas en este caso) y múltiples grupos, estos deben introducirse a través de un long data.frame que contenga hasta cinco columnas:
+
++ Sample: Cada una de las muestras (pacientes en este caso).
++ Feature: Cada uno de los genes.
++ View (opcional): Cada una de la modalidad de datos (normalmente, cada tipo ómico).
++ Group (opcional): Diferentes batches o condiciones experimentales.
++ Value.
+
+Por tanto, antes de utilizar el algoritmo de integración, debo modificar los tres data frames ómicos generados anteriormente y combinarlos.
+
+```{r}
+# RNA Seq
+view_rnaseq <- rnaseq_hvg_pacientes %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>%
+  mutate(view = "RNASeq",
+        group = pacientes_multiomicos$cogdx[match(sample, 
+                                  pacientes_multiomicos$individualID)]) %>% 
+  dplyr::select(view, sample, group, feature, value)
+
+# Metilacion
+view_metilacion <- metilacion_hvg_pacientes %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>%
+  mutate(view = "metilacion",
+        group = pacientes_multiomicos$cogdx[match(sample, 
+                                  pacientes_multiomicos$individualID)]) %>% 
+  dplyr::select(view, sample, group, feature, value)
+
+# Proteómica
+view_proteomica <- proteomica_hvg_pacientes %>% 
+  pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>%
+  mutate(view = "proteomica",
+        group = pacientes_multiomicos$cogdx[match(sample, 
+                                  pacientes_multiomicos$individualID)]) %>% 
+  dplyr::select(view, sample, group, feature, value)
+
+# Combino los tres
+datos_multiomicos <- rbind(view_rnaseq, view_metilacion, view_proteomica)
+```
+
+```{r}
+# Exporto la tabla combinada
+write.table(datos_multiomicos, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\datos_multiomicos.csv")
+```
+
+## Visualización de los NA por grupo
+
+```{r}
+#ggplot(data = datos_multiomicos)
+```
+
+
+# Creación del objeto MOFA multigrupo
+
+Para la creación del objeto MOFA utilizo la función `create_mofa_from_df`.
+
+```{r}
+# Generación del objeto MOFA
+MOFAobject <- create_mofa_from_df(datos_multiomicos)
+```
+
+```{r}
+print(MOFAobject)
+```
+
+```{r}
+# Visualizaión 
+plot_data_overview(MOFAobject)
+```
+
+```{r}
+metadatos_MOFA <- MOFAobject@samples_metadata %>% 
+  rowwise() %>% 
+  mutate(sexo = pacientes_multiomicos$msex[pacientes_multiomicos$
+                                          individualID == sample],
+         apoe = pacientes_multiomicos$apoe_genotype[pacientes_multiomicos$
+                                          individualID == sample],
+         ceradsc = pacientes_multiomicos$cerasdc[pacientes_multiomicos$
+                                          individualID == sample],
+         braaksc = pacientes_multiomicos$braaksc[pacientes_multiomicos$
+                                          individualID == sample])
+```
+
+```{r}
+samples_metadata(MOFAobject) <- metadatos_MOFA
+```
+
+## Entrenamiento del modelo
+
+### Definición de las opciones
+
+Indico `scale_views = TRUE`, ya que se aconseja que si los distintos views (tipos ómicos) tienen varianzas distintas, se escale cada una a varianza unitaria.
+
+```{r}
+# Opciones de los datos
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$scale_views = TRUE
+head(data_opts)
+```
+
+```{r}
+# Opciones del modelo
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 10
+head(model_opts)
+```
+
+```{r}
+# Opciones de entrenamiento
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+head(train_opts)
+```
+
+### Entrenamiento
+
+```{r}
+# Preparación del objeto MOFA. NO VOLVER A EJECUTAR
+MOFAobject <- prepare_mofa(object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts)
+```
+
+```{r}
+# Entrenamiento
+MOFAobject.trained <- run_mofa(MOFAobject, 
+    outfile = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\MOFA_MULTIOMICO\\modeloMOFA.hdf5", 
+    use_basilisk=TRUE)
+```
+
+```{r}
+plot_data_overview(MOFAobject.trained) 
+```
+
+## Interpretación de los resultados
+
+Como se explica en Argelaguet et al. (2020), la interpretación de cada uno de los factores es análoga a la interpretación de los componentes principales de un PCA. La matriz de pesos indica la intensidad de relación entre una característica y un factor determinado, aunque es importante reseñar que la escala de los pesos no se pueden comparar entre distintos views, sino dentro de cada view. 
+
+En mi caso se han detectado 10 factores que explican al menos un 1% de la variación de las distintas características.
+
+
+```{r}
+plot_factor_cor(MOFAobject.trained)
+```
+
+```{r}
+plot_variance_explained(MOFAobject.trained) +
+  theme(strip.text = element_text(size=20, face="bold", 
+                                  hjust = 0.5),
+        axis.title =  element_text(size=15, face="bold"),
+        axis.text = element_text(size=13),
+        legend.text = element_text(size=12, hjust = 0.5),
+        legend.title =  element_text(size=15, face="bold", 
+                                  hjust = 0.5))
+```
+
+```{r}
+plot_variance_explained(MOFAobject.trained, plot_total = T)[[2]] +
+  theme(strip.text = element_text(size=20, face="bold", 
+                                  hjust = 0.5),
+        axis.title =  element_text(size=15, face="bold"),
+        axis.text = element_text(size=13))
+```
+
+```{r}
+# Scatter plot de los valores de dos factores latentes
+plot_factors(MOFAobject.trained, factors = 1:9, 
+             color_by = "group")
+```
+
+La gráfica de abajo muestra la distribución de los eigenvalues obtenidos para cada uno de los factores.
+
+```{r}
+plot_factor(MOFAobject.trained, factors = 1:10, group_by = NULL,
+            dodge = TRUE, color_by = "ceradsc", dot_size = 1) +
+  scale_y_continuous(limits = c(-50, 50)) +
+  theme(strip.text = element_text(size=15, face="bold", 
+                                  hjust = 0.5),
+        axis.title =  element_text(size=15, face="bold"),
+        axis.text = element_text(size=12),
+        legend.text = element_text(size=12, hjust = 0.5),
+        legend.title =  element_text(size=15, face="bold", 
+                                  hjust = 0.5))
+```
+
+
+## Factor 1
+
+```{r}
+plot_variance_explained(MOFAobject.trained, x="group", y="view",
+                        factor=1, legend = T) +
+  ggtitle("Factor 1") +
+  theme(plot.title = element_text(size=40, face="bold", 
+                                  hjust = 0.5),
+        axis.text = element_text(size=25),
+        legend.text = element_text(size=25, hjust = 0.5),
+        legend.title =  element_text(size=32, face="bold", 
+                                  hjust = 0.5))
+```
+
+```{r}
+plot_factor(MOFAobject.trained, factors = 1, group_by = NULL,
+            add_violin = TRUE, add_boxplot = TRUE, dodge = TRUE,
+            dot_size = 1) +
+  theme(axis.title =  element_text(size=30, face="bold"),
+        axis.text = element_text(size=20),
+        legend.text = element_text(size=20, hjust = 0.5),
+        legend.title =  element_text(size=25, face="bold", 
+                                  hjust = 0.5))
+```
+
+### Pesos RNASeq
+
+```{r}
+plot_weights(MOFAobject.trained, view = "RNASeq", 
+             factors = 1, text_size = 2, scale = F) +
+  ggtitle("Factor 1") +
+  theme(plot.title = element_text(size=20, face="bold", 
+                                  hjust = 0.5))
+```
+
+
+```{r}
+plot_top_weights(MOFAobject.trained, view = "RNASeq",
+                 factor = 1,
+                 nfeatures = 20, #Number of features to highlight
+                 scale = T)   +
+  theme(strip.text = element_text(size=20, face="bold", 
+                                  hjust = 0.5),
+        axis.title =  element_text(size=15, face="bold"),
+        axis.text = element_text(size=14))
+```
+
+```{r}
+plot_data_scatter(MOFAobject.trained,
+  view = "RNASeq",         # view of interest
+  factor = 1,             # factor of interest
+  features = 12,           # number of features to plot (they are selected by weight)
+  add_lm = FALSE,          # add linear regression
+  lm_per_group = FALSE,
+  dot_size = 1,
+  color_by = "group") +
+  xlab("Factor 1 values")
+```
+
+### Pesos Proteómica
+
+```{r}
+plot_weights(MOFAobject.trained, view = "proteomica", 
+             factors = 1, text_size = 2, scale = F) +
+  ggtitle("Factor 1") +
+  theme(plot.title = element_text(size=20, face="bold", 
+                                  hjust = 0.5))
+```
+
+
+```{r}
+plot_top_weights(MOFAobject.trained, view = "proteomica",
+                 factor = 1,
+                 nfeatures = 20, #Number of features to highlight
+                 scale = F)  #Scale weights from -1 to 1
+```
+
+```{r}
+plot_data_scatter(MOFAobject.trained,
+  view = "proteomica",         # view of interest
+  factor = 1,             # factor of interest
+  features = 12,           # number of features to plot (they are selected by weight)
+  add_lm = FALSE,          # add linear regression
+  lm_per_group = FALSE,
+  dot_size = 1,
+  color_by = "group") +
+  xlab("Factor 1 values")
+```
+
+### Pesos Metilación
+
+```{r}
+plot_weights(MOFAobject.trained, view = "metilacion", 
+             factors = 1, text_size = 2, scale = F) +
+  ggtitle("Factor 1") +
+  theme(plot.title = element_text(size=20, face="bold", 
+                                  hjust = 0.5))
+```
+
+```{r}
+plot_top_weights(MOFAobject.trained, view = "metilacion",
+                 factor = 1,
+                 nfeatures = 20, #Number of features to highlight
+                 scale = F)  #Scale weights from -1 to 1
+```
+
+```{r}
+plot_data_scatter(MOFAobject.trained,
+  view = "metilacion",         # view of interest
+  factor = 1,             # factor of interest
+  features = 12,           # number of features to plot (they are selected by weight)
+  add_lm = FALSE,          # add linear regression
+  lm_per_group = FALSE,
+  dot_size = 1,
+  color_by = "group") +
+  xlab("Factor 1 values")
+```
+
+Se repite el mismo código para los 9 factores restantes.
+
+## Generación de los feature sets
+
+Antes de realizar el FSEA voy a crear un data frame que contenga para cada categoría de gene ontology, su descripción y gen (en formato ensembl y symbol).
+
+```{r}
+# Lista de gene ontology
+gene_ontology <- msigdbr(species = "Homo sapiens", category = NULL,
+                         subcategory = "BP") %>% 
+  dplyr::select(gs_exact_source, gs_name, gs_description,
+                human_ensembl_gene, gene_symbol) 
+
+
+  mutate(uniprot = AnnotationDbi::select(org.Hs.eg.db, 
+                 keys = gs_exact_source, 
+                 keytype = "GO", 
+                 columns = "UNIPROT"))
+```
+
+
+```{r}
+# Genero la gene list de ensembl (para RNASeq)
+gene_list_ensembl <- gene_ontology  %>% 
+  dplyr::select(gs_name, human_ensembl_gene) %>% 
+  na.omit() %>% 
+  distinct() %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = human_ensembl_gene, values_from = value, 
+              values_fill = list(value = 0))
+
+gene_ontology_ensembl <-  gene_list_ensembl$gs_name
+
+gene_list_ensembl <- as.matrix(gene_list_ensembl[, -1])
+
+rownames(gene_list_ensembl) <- gene_ontology_ensembl
+
+
+# Genero la gene list de uniprot (lo usaré con proteomica)
+uniprot_go <- AnnotationDbi::select(org.Hs.eg.db, 
+                      keys = unique(gene_ontology$gs_exact_source),
+                      keytype = "GO", 
+                      columns = c("GO", "UNIPROT"))
+
+
+gene_list_uniprot <- gene_ontology  %>% 
+  dplyr::select(gs_name, gs_exact_source) %>% 
+  left_join(uniprot_go, 
+            by = c("gs_exact_source" = "GO")) %>%
+  dplyr::select(gs_name, UNIPROT) %>%
+  distinct() %>%
+  distinct() %>%
+  mutate(value = 1) %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = UNIPROT, values_from = value, 
+              values_fill = list(value = 0))
+
+gene_ontology_uniprot <-  gene_list_uniprot$gs_name
+
+gene_list_uniprot <- as.matrix(gene_list_uniprot[, -1])
+
+rownames(gene_list_uniprot) <- gene_ontology_uniprot
+```
+
+Para hacer la lista de CpGs asociados a categorías de Gene Ontology, no puedo utilizar las 365860 sondas que se ubican en algún gen, porque no es computacionalmente posible. En su lugar voy a seleccionar las sondas HVGs seleccionadas previamente y un 5% aleatorio del resto.
+
+```{r}
+# Obtengo los datos de anotación 450K
+genes_cpgs <- as.data.frame(getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)) %>% 
+  dplyr::select("Name", "UCSC_RefGene_Name") %>% 
+  separate_rows(UCSC_RefGene_Name, sep = ";") %>%
+  filter(UCSC_RefGene_Name != "") %>% 
+  distinct()
+
+# Genero los indices del 10% de los CpGs que voy a utilizar para la genelist
+set.seed(123)
+indices <- sample(1:length(unique(genes_cpgs$Name)), 
+      size = as.integer(length(unique(genes_cpgs$Name)) * 0.1))
+
+# Extraigo los CpGs filtrados
+genes_cpgs_filtrado <- genes_cpgs %>% 
+  filter(Name %in% union(unique(genes_cpgs$Name)[indices], 
+                         rownames(metilacion_hvg)))
+
+# Genero la gene list con los CpGs filtrados
+gene_list_cpgs <- gene_ontology  %>% 
+  dplyr::select(gs_name, gene_symbol) %>%
+  left_join(genes_cpgs_filtrado, 
+            by = c("gene_symbol" = "UCSC_RefGene_Name")) %>%
+  dplyr::select(gs_name, Name) %>%
+  distinct() %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = Name, values_from = value, 
+              values_fill = list(value = 0))
+
+gene_ontology_cpgs <-  gene_list_cpgs$gs_name
+
+gene_list_cpgs <- as.matrix(gene_list_cpgs[, -1])
+
+rownames(gene_list_cpgs) <- gene_ontology_cpgs
+```
+
+## GSEA
+
+En ocasiones, los factores no pueden ser fácilmente caracterizados simplemente inspeccionando las características con mayor peso de cada factor. Puede ser útil combinar información entre los distintos genes y trabajar mediante gene sets (como gene ontology).
+
+### RNA Seq
+
+```{r}
+# GSEA RNA Seq características con pesos positivos
+enrichment_rnaseq_positive <- run_enrichment(MOFAobject.trained,
+                      view = "RNASeq",
+                      feature.sets = gene_list_ensembl,
+                      sign = "positive",
+                      alpha = 0.05)
+
+# GSEA RNA Seq características con pesos negativos
+enrichment_rnaseq_negative <- run_enrichment(MOFAobject.trained,
+                      view = "RNASeq",
+                      feature.sets = gene_list_ensembl,
+                      sign = "negative",
+                      alpha = 0.05)
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_rnaseq_negative$sigPathways
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_rnaseq_positive$sigPathways
+```
+
+### Metilacion
+
+```{r}
+# GSEA Metilacion características con pesos positivos
+enrichment_metilacion_positive <-
+  run_enrichment(MOFAobject.trained,
+                 view = "metilacion",
+                 feature.sets = gene_list_cpgs,
+                 sign = "positive",
+                 alpha = 0.05)
+
+# GSEA Metilacion características con pesos negativos
+enrichment_metilacion_negative <-
+  run_enrichment(MOFAobject.trained,
+                 view = "metilacion",
+                 feature.sets = gene_list_cpgs,
+                 sign = "negative",
+                 alpha = 0.05)
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_metilacion_negative$sigPathways
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_metilacion_positive$sigPathways
+```
+
+### Proteomica
+
+```{r}
+# GSEA proteómica características con pesos positivos
+enrichment_proteomica_positive <-
+  run_enrichment(MOFAobject.trained,
+                 view = "proteomica",
+                 feature.sets = gene_list_uniprot,
+                 sign = "positive",
+                 alpha = 0.05)
+
+# GSEA proteomia características con pesos negativos
+enrichment_proteomica_negative <-
+  run_enrichment(MOFAobject.trained,
+                 view = "proteomica",
+                 feature.sets = gene_list_uniprot,
+                 sign = "negative",
+                 alpha = 0.05)
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_proteomica_negative$sigPathways
+```
+
+```{r}
+# Rutas significativas a lo largo de los factores
+enrichment_proteomica_positive$sigPathways
+```
+
+
+```{r}
+plot_enrichment(enrichment_rnaseq_positive, 
+  factor = 1, 
+  max.pathways = 15
+) + ggtitle("Factor 1 - RNASeq - Pesos Positivos") +
+theme(title =  element_text(face="bold"),
+      axis.text = element_text(size=12, face = "bold"),
+      axis.title =  element_text(size=15, face="bold",
+                                 hjust = 0.5))
+```
+
+```{r}
+plot_enrichment_heatmap(enrichment_rnaseq_positive, 
+                        main ="Heatmap - RNASeq - Pesos Positivos") 
+```
+
+
+```{r}
+plot_enrichment(enrichment_metilacion_positive, 
+  factor = 2, 
+  max.pathways = 15
+)
+```
+
+```{r}
+plot_enrichment(enrichment_metilacion_negative, 
+  factor = 1, 
+  max.pathways = 15
+)
+```
+
+```{r}
+plot_enrichment(enrichment_metilacion_positive, 
+  factor = 2, 
+  max.pathways = 15
+)
+```
+
+
+
+# Bibliografía
+
++ Argelaguet, R., Arnol, D., Bredikhin, D., Deloro, Y., Velten, B., Marioni, J. C., & Stegle, O. (2020). MOFA+: a statistical framework for comprehensive integration of multi-modal single-cell data. Genome Biology, 21(1). https://doi.org/10.1186/s13059-020-02015-1
++ Argelaguet, R., Velten, B., Arnol, D., Dietrich, S., Zenz, T., Marioni, J. C., Buettner, F., Huber, W., & Stegle, O. (2018). Multi‐Omics Factor Analysis—a framework for unsupervised integration of multi‐omics data sets. Molecular Systems Biology, 14(6). https://doi.org/10.15252/msb.20178124
++ Athieniti, E., & Spyrou, G. M. (2023). A guide to multi-omics data collection and integration for translational medicine. Computational and Structural Biotechnology Journal, 21, 134–149. https://doi.org/10.1016/j.csbj.2022.11.050
++ https://www.bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/getting_started_R.html
+
+

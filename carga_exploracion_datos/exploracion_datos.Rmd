@@ -1,0 +1,721 @@
+---
+title: "exploracion_datos"
+author: "Pablo Aguirre Azorín"
+date: "2023-11-08"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(cache = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+#Cargo las librerías necesarias.
+library(synapser) 
+library(synapserutils)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(R.utils) # Para usar gunzip
+library(ggVennDiagram)
+library(VennDiagram)
+```
+
+---
+
+\newpage
+
+# Obtención de los datos
+
+Procedo a cargar de Synapse todos los archivos necesarios para realizar los análisis.
+
+```{r, eval=FALSE}
+#library(synapser) 
+#library(synapserutils) 
+ 
+# synLogin('usuario', 'clave') 
+
+# CARGO LOS DISTINTOS ARCHIVOS
+
+# METADATOS
+# Datos clínicos de cada paciente
+synGet(entity='syn3191087', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local")
+# Datos de las distintas muestras de los pacientes
+synGet(entity='syn21323366', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local")
+ # metadatos array metilación DNA
+synGet(entity='syn3168775', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local") 
+# metadatos proteómicos
+synGet(entity='syn21448317', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local") 
+
+
+# RNA-Seq
+# Tabla de contajes RAW
+synGet(entity='syn8691134', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local")
+
+
+# Epigenéticos
+# datos array metilación DNA
+synGet(entity='syn3168763', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local") 
+ 
+
+# Proteómicos
+synGet(entity='syn21449471', 
+       downloadLocation = "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP", 
+       ifcollision = "keep.local") 
+```
+
+```{r, eval= FALSE}
+# Descomprimir archivos
+
+gunzip("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_all_counts_matrix.txt.gz", remove = FALSE)
+gunzip("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_arraymethylation_imputed.tsv.gz", remove = FALSE)
+```
+
+# Exploración inicial de los datos
+
+## Datos clínicos de los pacientes
+
+El archivo `rosmap_clinical.csv` recoge una serie de datos clínicos acerca de los pacientes. Lo voy a cargar en el data frame `pacientes` y voy a hacer una serie de modificaciones y filtrado de variables.
+
+```{r}
+pacientes <- read.csv("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_clinical.csv")
+str(pacientes)
+```
+
+De la tabla pacientes voy a seleccionar las variables `individualID`, `msex`, `cogdx` (correspondiente al diagnóstico final en el momento de la muerte del paciente), `educ`, `race`, `spanish`, `apoe_genotype`, `ceradsc`, `braaksc`.
+
+```{r}
+#library(dplyr)
+#library(tidyr)
+pacientes <- pacientes %>% 
+  mutate(msex = factor(msex, labels = c("Female", "Male")),
+         spanish = factor(spanish, labels = c("Yes", "No")),
+         race = factor(race, labels = c("White", "African American", 
+                                           "American Indian", "Native Hawaiian",
+                                           "Asian", "Other", "Unknown")),
+         cogdx = as.factor(case_when(cogdx == 1 ~ "NCI",
+                                     cogdx %in% c(2,3) ~ "MCI",
+                                     cogdx %in% c(4,5) ~ "AD",
+                                     cogdx == 6 ~ "Other")),
+         ceradsc = as.factor(case_when(ceradsc == 1 ~ "Frecuente_AB",
+                                       ceradsc == 2 ~ "Moderado_AB",
+                                       ceradsc == 3 ~ "Escaso_AB",
+                                       ceradsc == 4 ~ "Nulo_AB")),
+         braaksc = as.factor(case_when(braaksc %in% c(1,2) ~
+                                         "Entorhinal_NFTs",
+                                       braaksc %in% c(3,4) ~
+                                         "Limbic_NFTs",
+                                       braaksc %in% c(5,6) ~
+                                         "Neocortical_NFTs"))) %>% 
+  dplyr::select(individualID, msex, cogdx, educ, race, spanish, apoe_genotype, ceradsc, braaksc)
+```
+
+Como se muestra en la estructura interna del data frame, hay 4 posibles diagnósticos de los pacientes:
+
++ AD: Enfermedad de Alzheimer.
++ MCI: Deterioro cognitivo leve.
++ NCI: Sin deterioro cognitivo.
++ Other: Otras demencias.
+
+```{r}
+str(pacientes)
+```
+
+```{r}
+# Por sexo
+table(pacientes$msex)
+```
+
+```{r}
+# Por diagnóstico
+table(pacientes$cogdx)
+```
+
+```{r}
+# Antes de hacer el diagrama de sectores, voy a generar una tabla que me resuma
+# el número de pacientes por grupo diagnóstico
+grupos_pacientes <- pacientes %>% 
+  filter(cogdx != is.na(cogdx)) %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n())
+
+grupos_pacientes %>% 
+  ggplot(aes(x = "", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico") +
+  scale_fill_brewer()
+
+ggsave("pacientes.png", plot = last_plot())
+```
+
+
+## Datos de las distintas muestras
+
+El fichero `rosmap_biospecimen_metadata.csv` contiene metadatos asociados a las distintas muestras tomadas de los pacientes, que explican de qué paciente ha sido extraída la muestra, de qué tejido, qué ensayo se ha realizado con ella, si ha sido finalmente excluída y por qué, etc.
+
+Este fichero me interesa para identificar con qué pacientes se ha realizado cada una de las pruebas que voy a analizar, así como a qué grupo diagnóstico pertenecen y, finalmente, identificar aquellos pacientes que tienen muestras en todas las pruebas que voy a analizar, para decidir si quedarme exclusivamente con ellos de cara a realizar la integración multiómica.
+
+```{r}
+muestras <- read.csv("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_biospecimen_metadata.csv")
+str(muestras)
+```
+
+# Preparación de los datos de RNA seq
+
+Primeramente cargo la tabla de contajes.
+
+```{r}
+contajes_rnaseq_raw <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_all_counts_matrix.txt", header = TRUE, check.names = FALSE)
+```
+
+Procedo a preparar la carga de contajes para su análisis.
+
+```{r}
+# Elimino aquellas filas que no correspondan a genes (filtrando por aquellas
+# filas que empiecen por el prefijo ENSG)
+
+contajes_rnaseq_raw <- contajes_rnaseq_raw %>% 
+  filter(grepl("^ENSG.*", feature)) %>% 
+  rename(gene_id = feature)
+
+```
+
+Para generar la tabla de pacientes de RNA Seq primero voy a crear un vector con los ID de las muestras de RNA Seq.
+
+```{r}
+# Vector con los id de las muestras de RNA Seq
+muestras_rnaseq <- colnames(contajes_rnaseq_raw)
+
+# Crear la tabla de los pacientes de RNA seq
+pacientes_rnaseq_sinfiltrar <- pacientes %>% 
+  filter(individualID %in% unique(muestras$individualID[muestras$specimenID
+                                  %in% muestras_rnaseq])) %>% 
+  rowwise() %>%  # Para que la siguiente operación se produzca fila por fila
+  mutate(rnaseqID = unique(muestras_rnaseq[muestras_rnaseq %in%
+                    muestras$specimenID[muestras$individualID ==
+                                        individualID]]))
+```
+
+Voy a examinar la tabla de `pacientes_rnaseq`.
+
+```{r}
+# Antes de hacer el diagrama de sectores, voy a generar una tabla que me resuma
+# el número de pacientes por grupo diagnóstico
+grupos_pacientes_rnaseq <- pacientes_rnaseq_sinfiltrar %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n())
+
+grupos_pacientes_rnaseq %>% 
+  ggplot(aes(x = "", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico",
+       title = "Pacientes de las muestras de RNA seq antes de filtrar") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0,
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_rnaseq_sinfiltrar.png", plot = last_plot())
+```
+
+Debido a la baja proporción del grupo correspondiente a otras demencias y a que el objetivo del estudio es estudar el alzheimer, voy a eliminar las 9 muestras correspondientes a este grupo.
+
+```{r}
+# Genero la tabla de pacientes de rnaseq filtrada
+pacientes_rnaseq <- pacientes_rnaseq_sinfiltrar %>% 
+  filter(cogdx != "Other")
+```
+
+
+```{r}
+pacientes_rnaseq %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "Pacientes de las muestras de RNA seq tras filtrar") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_rnaseq_filtrado.png", plot = last_plot())
+```
+
+Seguidamente, voy a generar la tabla de contajes a partir de los ficheros descargados de Synapse y modificando los IDs de las muestras, de tal manera que aparezcan los tres grupos a estudiar en ellas.
+
+```{r}
+# Genero un vector con los nombres de las columnas, los cuales acaban con
+# el grupo al que pertenecen (AD, MCI o NCI)
+muestras_rnaseq_id <- c() 
+for (i in muestras_rnaseq) {
+  if (i %in% pacientes_rnaseq$rnaseqID) {
+    grupo = pacientes_rnaseq$cogdx[pacientes_rnaseq$rnaseqID == i]
+    muestras_rnaseq_id <- c(muestras_rnaseq_id, 
+                               paste(i, grupo, sep = "_")) 
+  }
+  else {
+    muestras_rnaseq_id <- c(muestras_rnaseq_id, i) 
+  }
+}
+
+# Renombro las muestras con los ID generados
+colnames(contajes_rnaseq_raw) <- muestras_rnaseq_id
+
+# Elimino las muestras cuyo diagnóstico es "Other" y de las que no consta su paciente asociado.
+contajes_rnaseq_raw_filtrado <- contajes_rnaseq_raw %>% 
+  select(ends_with(c("gene_id", "AD", "MCI", "NCI")))
+```
+
+Por último, guardo los data frames generados (tanto los metadatos como los datos) en archivos para ser analizados. 
+
+```{r}
+write.table(contajes_rnaseq_raw_filtrado,
+  "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\contajes_rnaseq.csv")
+```
+
+```{r}
+write.table(pacientes_rnaseq, 
+  "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\RNA_seq\\metadatos_rnaseq.csv")
+```
+
+# Preparación de los datos de metilación del ADN
+
+```{r}
+# Se cargan los datos de metilacion
+predata_metilacion <- read.table("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\rosmap_arraymethylation_imputed.tsv", header = TRUE, check.names = FALSE)
+```
+
+## Tabla de pacientes de metilación del ADN
+
+```{r}
+# Se extraen las muestras
+muestras_metilacion <- colnames(predata_metilacion)
+
+# Se genera la tabla de pacientes
+pacientes_metilacion_sinfiltrar <- pacientes %>%
+  filter(individualID %in% muestras$individualID[muestras$specimenID
+                                  %in% muestras_metilacion]) %>% 
+  rowwise() %>% 
+  mutate(metilacionID = muestras_metilacion[muestras_metilacion %in%
+        muestras$specimenID[muestras$individualID == individualID]])
+```
+
+Voy a representar ahora la distribución en grupos de los pacientes de metilación del ADN.
+
+```{r}
+# Visualización de la distribución por grupo diagnóstico
+pacientes_metilacion_sinfiltrar %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico",
+       title = "Pacientes de las muestras de metilación del ADN sin filtrar") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_metilacion_sinfiltrar.png", plot = last_plot())
+```
+
+Voy a eliminar los pacientes de NA y del grupo Other.
+
+```{r}
+# Genero la tabla de pacientes de metilación filtrada
+pacientes_metilacion <- pacientes_metilacion_sinfiltrar %>% 
+  filter(cogdx != "Other",
+         cogdx != is.na(cogdx))
+```
+
+```{r}
+pacientes_metilacion %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x = "", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "Pacientes de las muestras de metilación del ADN tras filtrar") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_metilacion_filtrado.png", plot = last_plot())
+```
+
+```{r}
+# Genero un vector con los nombres de las columnas, los cuales acaban con
+# el grupo al que pertenecen (AD, MCI o NCI)
+muestras_metilacion_id <- c() 
+for (i in muestras_metilacion) {
+  if (i %in% pacientes_metilacion$metilacionID) {
+    grupo = pacientes_metilacion$cogdx[pacientes_metilacion$metilacionID == i]
+    muestras_metilacion_id <- c(muestras_metilacion_id, 
+                               paste(i, grupo, sep = "_")) 
+  }
+  else {
+    muestras_metilacion_id <- c(muestras_metilacion_id, i) 
+  }
+}
+
+# Renombro las muestras con los ID generados
+colnames(predata_metilacion) <- muestras_metilacion_id
+
+# Elimino aquellas variables que corresponden a un diagnóstico NA u Other
+datos_metilacion <- predata_metilacion %>% 
+  select(ends_with(c("TargetID", "NCI", "AD", "MCI")))
+```
+
+Por último guardo los archivos finales para ser posteriormente analizados.
+
+```{r}
+write.table(datos_metilacion, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\datos_metilacion.csv")
+
+write.table(pacientes_metilacion, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\metilacion_DNA\\pacientes_metilacion.csv")
+```
+
+# Preparación de los datos proteómicos
+
+```{r}
+# Se cargan los datos proteomicos
+predata_proteomicos <- read.csv("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\3.cleandat.csv")
+# Metadatos
+metadatos_proteomicos <- read.csv("E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\archivos_ROSMAP\\0.traits-age_censored.csv")
+```
+
+```{r}
+# Nombro la primera columna como los id de proteinas
+colnames(predata_proteomicos)[1] <- "protein_id"
+```
+
+```{r}
+# Vector con los id de las muestras de proteinas
+muestras_proteinas <- colnames(predata_proteomicos)
+
+# Extraigo los specimenID con la tabla de metadatos
+specimenID_proteinas <- metadatos_proteomicos$SpecimenID[metadatos_proteomicos$SampleID 
+                                 %in% muestras_proteinas]
+
+# Crear la tabla de los pacientes de RNA seq
+pacientes_proteinas_sinfiltrar <- pacientes %>% 
+  filter(individualID %in% muestras$individualID[muestras$specimenID
+                                  %in% specimenID_proteinas]) %>% 
+    rowwise() %>%  # Para que la siguiente operación se produzca fila por fila
+  mutate(proteomicID = 
+           metadatos_proteomicos$SampleID[metadatos_proteomicos$SpecimenID %in% 
+                       muestras$specimenID[muestras$individualID == 
+                                             individualID]],
+         batch = metadatos_proteomicos$Batch[metadatos_proteomicos$SpecimenID 
+                %in% muestras$specimenID[muestras$individualID == individualID]])
+```
+
+Voy a representar ahora la distribución en grupos de los pacientes proteómicos.
+
+```{r}
+# Visualización de la distribución por grupo diagnóstico
+pacientes_proteinas_sinfiltrar %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico",
+       title = "Pacientes de las muestras proteómicas sin filtrar") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_proteomicos_sinfiltrar.png", plot = last_plot())
+```
+
+Voy a eliminar los pacientes del grupo Other.
+
+```{r}
+# Genero la tabla de pacientes de metilación filtrada
+pacientes_proteinas <- pacientes_proteinas_sinfiltrar %>% 
+  filter(cogdx != "Other")
+```
+
+```{r}
+pacientes_proteinas %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "Pacientes de las muestras proteómicas tras filtrar") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 15, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)))
+
+ggsave("pacientes_proteomicos_filtrado.png", plot = last_plot())
+```
+
+```{r}
+# Genero un vector con los nombres de las columnas, los cuales acaban con
+# el grupo al que pertenecen (AD, MCI o NCI)
+muestras_proteinas_id <- c() 
+for (i in muestras_proteinas) {
+  if (i %in% pacientes_proteinas$proteomicID) {
+    grupo = pacientes_proteinas$cogdx[pacientes_proteinas$proteomicID == i]
+    muestras_proteinas_id <- c(muestras_proteinas_id, 
+                               paste(i, grupo, sep = "_")) 
+  }
+  else {
+    muestras_proteinas_id <- c(muestras_proteinas_id, i) 
+  }
+}
+
+# Renombro las muestras con los ID generados
+colnames(predata_proteomicos) <- muestras_proteinas_id
+
+# Elimino aquellas variables que corresponden a un diagnóstico NA u Other
+datos_proteomicos <- predata_proteomicos %>% 
+  select(ends_with(c("protein_ID", "NCI", "AD", "MCI")))
+```
+
+Por último guardo los archivos finales para ser posteriormente analizados.
+
+```{r}
+write.table(datos_proteomicos, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\datos_proteomicos.csv")
+
+write.table(pacientes_proteinas, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\proteomica\\pacientes_proteomicos.csv")
+```
+
+# Preparación de los datos para la integración multiómica
+
+Como puede observarse en el diagrama de Venn generado, solo 127 (14%) de todos los pacientes presenta muestras de las tres ómicas de estudio.
+
+```{r}
+library(ggplot2)
+
+ggVennDiagram(list(rnaseq = pacientes_rnaseq$individualID, 
+                   metilacion = pacientes_metilacion$individualID,
+                   proteomica = pacientes_proteinas$individualID)) +
+  scale_fill_gradient(low = "#F4FAFE", high = "#4981BF") +
+  theme(legend.position = "none")
+
+#ggsave("diagrama_venn.png", plot = last_plot())
+```
+
+
+```{r}
+# Diagrama de Venn
+venn <- venn.diagram(list(rnaseq = pacientes_rnaseq$individualID, 
+                   metilacion = pacientes_metilacion$individualID,
+                   proteomica = pacientes_proteinas$individualID),
+             filename = "diagrama_venn.png",
+             fill = rainbow(3),
+             disable.logging = TRUE,
+             output = TRUE)
+```
+
+Paso a extraer los pacientes que poseen muestras en al menos dos ómicas.
+
+```{r}
+
+# Pacientes que poseen muestras en al menos dos ómicas
+interseccion_rnaseq_metilacion <- intersect(pacientes_rnaseq$individualID,                                          pacientes_metilacion$individualID)
+interseccion_rnaseq_proteomica <- intersect(pacientes_rnaseq$individualID,                                          pacientes_proteinas$individualID)
+interseccion_metilacion_proteomica <- intersect(pacientes_metilacion$individualID,                                          pacientes_proteinas$individualID)
+# Vector con los id de los pacientes multiomicos
+interseccion <- unique(c(
+  interseccion_rnaseq_proteomica,
+  interseccion_rnaseq_metilacion,
+  interseccion_metilacion_proteomica
+))
+
+# Data frame con los pacientes multiómicos
+pacientes_multiomicos <- pacientes %>% 
+  filter(individualID %in% interseccion) 
+
+# Genero un data frame para cada tipo ómico con los matches
+rnaseq_matches <- pacientes_rnaseq %>%
+  filter(individualID %in% pacientes_multiomicos$individualID) %>%
+  select(individualID, rnaseqID)
+
+metilacion_matches <- pacientes_metilacion %>% 
+  filter(individualID %in% pacientes_multiomicos$individualID) %>% 
+  select(individualID, metilacionID)
+
+proteomica_matches <- pacientes_proteinas %>% 
+  filter(individualID %in% pacientes_multiomicos$individualID) %>% 
+  select(individualID, proteomicID)
+
+# Añado los id de las muestras de cada tipo ómico
+pacientes_multiomicos <- pacientes_multiomicos %>%
+  left_join(rnaseq_matches, by = "individualID") %>%
+  left_join(metilacion_matches, by = "individualID") %>%
+  left_join(proteomica_matches, by = "individualID") 
+```
+
+En la documentación del paquete `MOFA2` de `Bioconductor` se afirma que es fundamental utilizar los datos propiamente normalizados.
+
+Por ello, para la integración multiómica se va a utilizar:
+
++ RNA-Seq: La tabla de contajes normalizados mediante TMM y convertidos en CPM (generada en el protocolo de análisis RNA-Seq).
++ Metilación: La tabla de Valores M, ya que se recomienda usar dichos valores para realizar análisis estadísticos. Esta tabla también se ha generado en el protocolo de análisis metilación.
++ Proteómica: La tabla descargada ya ha sido normalizada y preprocesada y contiene el log2 de la abundancia de los péptidos a lo largo de las muestras, centrado alrededor de la mediana cercana a 0.
+
+Procedo por tanto a preparar la tabla de pacientes proteómicos. La documentación de `MOFA2` recomienda
+
+Voy a modificar los id de las muestras por id de pacientes. Aquellos pacientes que no posean muestra proteómica, sera una columna de NA
+
+```{r}
+write.table(pacientes_multiomicos, "E:\\Documentos\\UNIVERSIDAD\\UOC\\TFM\\_R\\integracion_multiomica\\pacientes_multiomicos.csv")
+```
+
+
+
+```{r}
+plot1 <- grupos_pacientes %>% 
+  ggplot(aes(x = "", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico",
+       title = "a) Pacientes ROSMAP") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 10, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0,
+                                                  b = 2, l = 0)),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8, face = "bold"))
+
+
+plot2 <- pacientes_rnaseq %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "b) RNA-Seq") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 10, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8, face = "bold"))
+
+plot3 <- pacientes_metilacion %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x = "", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "c) Metilación") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 10, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8, face = "bold"))
+
+plot4 <- pacientes_proteinas %>% 
+  group_by(cogdx) %>% 
+  summarise(Cantidad = n()) %>% 
+  ggplot(aes(x="", y = Cantidad, fill = cogdx)) +
+  geom_col(color = "black") +
+  geom_label(aes(label = Cantidad), 
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(fill = "Grupo diagnóstico", 
+       title = "d) Proteómica") +
+  xlab("Grupo diagnóstico") +
+  scale_fill_brewer() +
+  theme(plot.title = element_text(size = 10, face = "bold", 
+                                  hjust = 0.5,
+                                  margin = margin(t = 40, r = 0, 
+                                                  b = 2, l = 0)),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8, face = "bold"))
+
+gridExtra::grid.arrange(plot1, plot2, plot3, plot4, 
+                        nrow = 2, ncol = 2)
+```
+
